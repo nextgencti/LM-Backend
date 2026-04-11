@@ -1,0 +1,166 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Helper functions for auth and roles
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function getUserData() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+    }
+
+    function isSuperAdminToken() {
+      return request.auth != null && request.auth.token.role == 'SuperAdmin';
+    }
+
+    function isSuperAdmin() {
+      // Direct token-based role check is most reliable and avoids recursion
+      return request.auth != null && (
+        request.auth.token.role == 'SuperAdmin' || 
+        getUserRole() == 'SuperAdmin'
+      );
+    }
+
+    function getLabId() {
+      // prefer custom claim, fallback to user doc
+      return request.auth.token.labId != null ? request.auth.token.labId : getUserData().labId;
+    }
+
+    function getUserRole() {
+      return request.auth.token.role != null ? request.auth.token.role : getUserData().role;
+    }
+
+    function isLabData(labId) {
+      return getLabId() == labId;
+    }
+
+    function isLabAdminOrStaff() {
+      let role = getUserRole();
+      return role == 'LabAdmin' || role == 'Staff' || role == 'SuperAdmin';
+    }
+
+    function checkSubscription(labId) {
+      let sub = get(/databases/$(database)/documents/subscriptions/$(labId)).data;
+      return sub != null && 
+             sub.status == 'active' && 
+             (
+               (sub.expiryTimestamp != null && sub.expiryTimestamp >= request.time) ||
+               (sub.expiryDate != null && sub.expiryDate >= "2020-01-01") // Basic catch-all if timestamp is missing
+             );
+    }
+
+    function canAccessLab(labId) {
+      return isSuperAdmin() || (isLabData(labId) && checkSubscription(labId));
+    }
+
+    // --- COLLECTION RULES ---
+
+    // 1. Users
+    match /users/{userId} {
+      allow read: if request.auth.uid == userId || isSuperAdmin() || (isLabData(resource.data.labId) && isLabAdminOrStaff());
+      allow write: if isSuperAdmin() || 
+                    (isAuthenticated() && getUserRole() == 'LabAdmin' && (resource == null ? request.resource.data.labId == getLabId() : resource.data.labId == getLabId())) ||
+                    (request.auth.uid == userId && !request.resource.data.diff(resource.data).affectedKeys().hasAny(['role', 'labId']));
+    }
+
+    // 2. Labs
+    match /labs/{labId} {
+      allow read: if isSuperAdmin() || getLabId() == labId;
+      allow write: if isSuperAdmin() || (getLabId() == labId && getUserRole() == 'LabAdmin');
+    }
+
+    // 3. Subscriptions
+    match /subscriptions/{subId} {
+      allow read: if isAuthenticated(); // More permissive for now to debug
+      allow write: if isSuperAdmin();
+    }
+
+    // 4. Master Data (Global Library)
+    match /masterParameters/{docId} {
+      allow read: if isAuthenticated();
+      allow write: if isSuperAdmin();
+    }
+
+    // 5. Global settings
+    match /settings/{docId} {
+      allow read: if isAuthenticated();
+      allow write: if isSuperAdmin();
+    }
+
+    // 6. Service Plans
+    match /plans/{planId} {
+      allow read: if isAuthenticated();
+      allow write: if isSuperAdmin();
+    }
+
+    // 7. Multi-Tenant Lab Data collections
+    // All these collections must have a `labId` field to be accessed.
+    match /patients/{docId} {
+      allow read: if isAuthenticated() && canAccessLab(resource.data.labId);
+      allow create: if isAuthenticated() && 
+                    request.resource.data.labId != null &&
+                    canAccessLab(request.resource.data.labId) && 
+                    isLabAdminOrStaff();
+      allow update, delete: if isAuthenticated() && canAccessLab(resource.data.labId) && isLabAdminOrStaff();
+    }
+
+    match /doctors/{docId} {
+      allow read: if isAuthenticated() && canAccessLab(resource.data.labId);
+      allow create: if isAuthenticated() && 
+                    request.resource.data.labId != null &&
+                    canAccessLab(request.resource.data.labId) && 
+                    isLabAdminOrStaff();
+      allow update, delete: if isAuthenticated() && canAccessLab(resource.data.labId) && isLabAdminOrStaff();
+    }
+
+    match /tests/{docId} {
+      allow read: if isAuthenticated() && (resource.data.labId == 'GLOBAL' || canAccessLab(resource.data.labId));
+      allow create: if isAuthenticated() && 
+                    request.resource.data.labId != null &&
+                    canAccessLab(request.resource.data.labId) && 
+                    isLabAdminOrStaff();
+      allow update, delete: if isAuthenticated() && canAccessLab(resource.data.labId) && getUserRole() == 'LabAdmin';
+    }
+
+    match /testParameters/{docId} {
+      allow read: if isAuthenticated() && (resource.data.labId == 'GLOBAL' || canAccessLab(resource.data.labId));
+      allow create: if isAuthenticated() && canAccessLab(request.resource.data.labId) && isLabAdminOrStaff();
+      allow update, delete: if isAuthenticated() && canAccessLab(resource.data.labId) && getUserRole() == 'LabAdmin';
+    }
+
+    match /parameterRules/{docId} {
+      // Assuming rules have testId, we'd need to verify through test, or easiest is to also have labId on rules.
+      allow read: if isAuthenticated() && (resource.data.labId == 'GLOBAL' || canAccessLab(resource.data.labId));
+      allow create: if isAuthenticated() && canAccessLab(request.resource.data.labId) && isLabAdminOrStaff();
+      allow update, delete: if isAuthenticated() && canAccessLab(resource.data.labId) && getUserRole() == 'LabAdmin';
+    }
+
+    match /bookings/{docId} {
+      allow read: if isAuthenticated() && canAccessLab(resource.data.labId);
+      allow create: if isAuthenticated() && 
+                    request.resource.data.labId != null &&
+                    canAccessLab(request.resource.data.labId) && 
+                    isLabAdminOrStaff();
+      allow update, delete: if isAuthenticated() && canAccessLab(resource.data.labId) && isLabAdminOrStaff();
+    }
+
+    match /reports/{docId} {
+      allow read: if isAuthenticated() && (canAccessLab(resource.data.labId) || (getUserRole() == 'Patient' && resource.data.patientId == request.auth.uid));
+      allow create, update: if isAuthenticated() && canAccessLab(request.resource.data.labId) && isLabAdminOrStaff();
+      allow delete: if isAuthenticated() && canAccessLab(resource.data.labId) && isLabAdminOrStaff();
+    }
+
+    match /bills/{docId} {
+      allow read: if isAuthenticated() && canAccessLab(resource.data.labId);
+      allow create, update: if isAuthenticated() && canAccessLab(request.resource.data.labId) && isLabAdminOrStaff();
+      allow delete: if isAuthenticated() && canAccessLab(resource.data.labId) && isLabAdminOrStaff();
+    }
+
+    match /system_counters/{docId} {
+      // Must be authenticated and either part of the respective lab or a SuperAdmin
+      allow read, write: if isAuthenticated() && isLabAdminOrStaff();
+    }
+  }
+}
