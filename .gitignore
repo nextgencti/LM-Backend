@@ -2,10 +2,7 @@ node_modules/
 .env
 *.log
 serviceAccountKey.json
-.firebaserc
-firebase.json
 test.json
-*.json
 scratch/
 tmp/
 .DS_Store
