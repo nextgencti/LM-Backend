@@ -10,6 +10,11 @@ app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
+// Health check endpoint for Cron Jobs
+app.get('/ping', (req, res) => {
+  res.status(200).send('pong');
+});
+
 // Helper: safely parse JSON from .env — fixes corrupted \n sequences in private keys
 // When copy-pasting, \nC becomes \C (n gets dropped). We restore it here.
 const safeParseServiceAccount = (raw) => {
