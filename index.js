@@ -1219,7 +1219,7 @@ app.post('/api/tests/sync-to-lab', authenticateJWT, isSuperAdmin, async (req, re
 // Reads emailProvider from settings/global and routes accordingly.
 app.post('/api/send-notification', authenticateJWT, async (req, res) => {
   try {
-    let { to, patientName, labName, bookingId, labId, testNames, reportUrl, reportHtml, pdfBase64 } = req.body;
+    let { to, subject, patientName, labName, bookingId, labId, testNames, reportUrl, reportHtml, pdfBase64 } = req.body;
 
     // ── DATA ENRICHMENT ──
     // If essential info is missing, fetch it using Admin SDK (bypasses client-side permission issues)
@@ -1296,7 +1296,7 @@ app.post('/api/send-notification', authenticateJWT, async (req, res) => {
         body: JSON.stringify({
           from: `${labName || 'Lab Mitra'} <onboarding@resend.dev>`,
           to: [to],
-          subject: `Your Lab Report is Ready - ${labName || 'Lab Mitra'}`,
+          subject: subject || `Your Lab Report is Ready - ${labName || 'Lab Mitra'}`,
           html: emailHtml
         })
       });
@@ -1319,9 +1319,9 @@ app.post('/api/send-notification', authenticateJWT, async (req, res) => {
         action: pdfBase64 ? "SEND_PDF_BASE64" : (reportHtml ? "SEND_REPORT_PDF" : "SEND_EMAIL_HTML"),
         email: to,
         patientName: patientName,
-        subject: pdfBase64 || reportHtml 
+        subject: subject || (pdfBase64 || reportHtml 
           ? `Pathology Report - ${patientName} (${labName || 'Lab'})`
-          : `Your Lab Report is Ready - ${labName || 'Lab Mitra'}`,
+          : `Your Lab Report is Ready - ${labName || 'Lab Mitra'}`),
         html: emailHtml,
         pdfBase64: pdfBase64
       };
