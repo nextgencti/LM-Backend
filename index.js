@@ -430,25 +430,89 @@ app.get('/api/public/report/:token', async (req, res) => {
       return res.status(404).json({ error: "Report not found or link expired" });
     }
 
-    const reportData = snapshot.docs[0].data();
+    const initialReportData = snapshot.docs[0].data();
+    let finalReportData = { id: snapshot.docs[0].id, ...initialReportData };
+
+    // Fetch Master Metadata Helper
+    const fetchMeta = async (r) => {
+      if (!r.category || r.category === 'General' || !r.sampleType || r.sampleType === 'N/A') {
+        try {
+          let masterDoc = null;
+          if (r.testId) {
+            const tDoc = await db.collection('tests').doc(String(r.testId)).get();
+            if (tDoc.exists) masterDoc = tDoc.data();
+          }
+          if (!masterDoc && r.testName) {
+            const baseName = String(r.testName).replace(/\[\d+\]$/, '').trim();
+            const searchIds = r.labId ? [String(r.labId), 'GLOBAL'] : ['GLOBAL'];
+            const tDocs = await db.collection('tests').where('testName', '==', baseName).where('labId', 'in', searchIds).limit(5).get();
+            if (!tDocs.empty) {
+              const docsList = tDocs.docs.map(d => d.data());
+              masterDoc = docsList.find(d => String(d.labId) === String(r.labId) && d.category && d.category !== 'General') 
+                          || docsList.find(d => d.labId === 'GLOBAL') 
+                          || docsList[0];
+            }
+          }
+          if (masterDoc) {
+            r.category = (masterDoc.category && masterDoc.category !== 'General') ? masterDoc.category : r.category;
+            r.sampleType = (masterDoc.sampleType && masterDoc.sampleType !== 'N/A') ? masterDoc.sampleType : r.sampleType;
+          }
+        } catch(e) {}
+      }
+      return r;
+    };
+
+    // Handle Multi-Test Merging
+    if (initialReportData.billId && initialReportData.labId) {
+      const billReportsSnap = await db.collection('reports')
+        .where('billId', '==', initialReportData.billId)
+        .where('labId', '==', initialReportData.labId)
+        .get();
+        
+      if (!billReportsSnap.empty) {
+        const allReports = await Promise.all(billReportsSnap.docs.map(async docSnap => {
+          let r = { id: docSnap.id, ...docSnap.data() };
+          return await fetchMeta(r);
+        }));
+
+        const mergedResults = allReports.flatMap(r => 
+          (r.results || []).map(res => ({ 
+            ...res, 
+            _testName: r.testName, 
+            _category: r.category || 'General', 
+            _sampleType: r.sampleType || 'N/A' 
+          }))
+        );
+        const mergedTestNames = allReports.map(r => r.testName).join(', ');
+        
+        finalReportData = {
+           ...allReports[0],
+           testName: mergedTestNames,
+           results: mergedResults,
+           status: allReports.every(r => r.status === 'Final') ? 'Final' : 'In Progress'
+        };
+      }
+    } else {
+      finalReportData = await fetchMeta(finalReportData);
+    }
     
-    // Safety check: only allow 'Final' reports to be viewed publicly
-    if (reportData.status !== 'Final') {
+    // Safety check: only allow 'Final' reports
+    if (finalReportData.status !== 'Final') {
       return res.status(403).json({ error: "This report is still being processed and is not yet available for public view." });
     }
 
     // Fetch Lab Profile
     let labProfile = null;
-    if (reportData.labId) {
+    if (finalReportData.labId) {
       try {
-        const ldoc = await db.collection('labs').doc(String(reportData.labId)).get();
+        const ldoc = await db.collection('labs').doc(String(finalReportData.labId)).get();
         if (ldoc.exists) labProfile = ldoc.data();
       } catch(e) {}
     }
 
     // Fetch Patient Data
     let patientData = null;
-    const pId = reportData.patientId || (reportData.labId && reportData.patient_id ? `${reportData.labId}_${reportData.patient_id}` : null);
+    const pId = finalReportData.patientId || (finalReportData.labId && finalReportData.patient_id ? `${finalReportData.labId}_${finalReportData.patient_id}` : null);
     if (pId) {
       try {
         const pdoc = await db.collection('patients').doc(String(pId)).get();
@@ -458,9 +522,9 @@ app.get('/api/public/report/:token', async (req, res) => {
 
     // Fetch Doctor Data
     let doctorData = null;
-    if (reportData.bookingId) {
+    if (finalReportData.bookingId) {
       try {
-        const bdoc = await db.collection('bookings').doc(String(reportData.bookingId)).get();
+        const bdoc = await db.collection('bookings').doc(String(finalReportData.bookingId)).get();
         if (bdoc.exists && bdoc.data().doctorId) {
           const ddoc = await db.collection('doctors').doc(String(bdoc.data().doctorId)).get();
           if (ddoc.exists) doctorData = ddoc.data();
@@ -468,7 +532,7 @@ app.get('/api/public/report/:token', async (req, res) => {
       } catch(e) {}
     }
 
-    res.json({ reportData, labProfile, patientData, doctorData });
+    res.json({ reportData: finalReportData, labProfile, patientData, doctorData });
   } catch (error) {
     console.error("Public report fetch error:", error);
     res.status(500).json({ error: "Internal server error" });
