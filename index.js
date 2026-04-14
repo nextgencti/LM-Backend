@@ -4,6 +4,7 @@ const cors = require('cors');
 const path = require('path');
 require('dotenv').config();
 const cron = require('node-cron');
+const crypto = require('crypto');
 
 const app = express();
 app.use(cors());
@@ -217,6 +218,11 @@ const secureSyncHandler = async (collection, prefix, req, res, versioning = fals
        } else {
            data.status = 'Pending';
        }
+
+       // Generate a high-entropy viewToken for public QR access if it doesn't exist
+       if (!mergedState.viewToken) {
+           data.viewToken = crypto.randomBytes(24).toString('hex');
+       }
     }
 
     const payload = {
@@ -401,6 +407,70 @@ app.get('/api/report/:bookingNo', authenticateJWT, checkSubscription, async (req
     res.json(reportData);
   } catch (error) {
     console.error("Error fetching report:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// Public: Fetch Report by high-entropy viewToken (No auth required)
+app.get('/api/public/report/:token', async (req, res) => {
+  if (!db) return res.status(500).json({ error: "Cloud connection down" });
+  const { token } = req.params;
+  
+  if (!token || token.length < 20) {
+    return res.status(400).json({ error: "Invalid or malformed token" });
+  }
+
+  try {
+    const snapshot = await db.collection('reports')
+      .where('viewToken', '==', token)
+      .limit(1)
+      .get();
+
+    if (snapshot.empty) {
+      return res.status(404).json({ error: "Report not found or link expired" });
+    }
+
+    const reportData = snapshot.docs[0].data();
+    
+    // Safety check: only allow 'Final' reports to be viewed publicly
+    if (reportData.status !== 'Final') {
+      return res.status(403).json({ error: "This report is still being processed and is not yet available for public view." });
+    }
+
+    // Fetch Lab Profile
+    let labProfile = null;
+    if (reportData.labId) {
+      try {
+        const ldoc = await db.collection('labs').doc(String(reportData.labId)).get();
+        if (ldoc.exists) labProfile = ldoc.data();
+      } catch(e) {}
+    }
+
+    // Fetch Patient Data
+    let patientData = null;
+    const pId = reportData.patientId || (reportData.labId && reportData.patient_id ? `${reportData.labId}_${reportData.patient_id}` : null);
+    if (pId) {
+      try {
+        const pdoc = await db.collection('patients').doc(String(pId)).get();
+        if (pdoc.exists) patientData = pdoc.data();
+      } catch(e) {}
+    }
+
+    // Fetch Doctor Data
+    let doctorData = null;
+    if (reportData.bookingId) {
+      try {
+        const bdoc = await db.collection('bookings').doc(String(reportData.bookingId)).get();
+        if (bdoc.exists && bdoc.data().doctorId) {
+          const ddoc = await db.collection('doctors').doc(String(bdoc.data().doctorId)).get();
+          if (ddoc.exists) doctorData = ddoc.data();
+        }
+      } catch(e) {}
+    }
+
+    res.json({ reportData, labProfile, patientData, doctorData });
+  } catch (error) {
+    console.error("Public report fetch error:", error);
     res.status(500).json({ error: "Internal server error" });
   }
 });
