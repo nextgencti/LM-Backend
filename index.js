@@ -116,8 +116,17 @@ const checkSubscription = async (req, res, next) => {
     const subData = subDoc.data();
     const today = new Date().toISOString().split('T')[0];
     
-    if (subData.status !== 'active' || (subData.expiryDate && subData.expiryDate < today)) {
-       return res.status(403).json({ error: "Subscription expired or suspended" });
+    // For fixed plans: check status and expiry
+    if (subData.plan !== 'pay_as_you_go') {
+        if (subData.status !== 'active' || (subData.expiryDate && subData.expiryDate < today)) {
+           return res.status(403).json({ error: "Subscription expired or suspended" });
+        }
+    } else {
+        // For token plans: check if status is active (expiry doesn't apply to tokens usually, or handles differently)
+        if (subData.status !== 'active') {
+           return res.status(403).json({ error: "Token account suspended" });
+        }
+        // Token balance check happens at action time (e.g. Staff create, Report finalize)
     }
     
     req.subscription = subData;
@@ -125,6 +134,63 @@ const checkSubscription = async (req, res, next) => {
   } catch (error) {
     console.error('Subscription check error:', error);
     res.status(500).json({ error: "Internal security error" });
+  }
+};
+
+// Helper: Deduct Tokens for specific lab
+const deductTokens = async (labId, taskKeyOrAmount, reason) => {
+  if (!db) return { success: false, error: "Cloud connection down" };
+  
+  try {
+    const subRef = db.collection('subscriptions').doc(String(labId));
+    const subDoc = await subRef.get();
+    
+    if (!subDoc.exists) return { success: false, error: "No subscription found" };
+    
+    const subData = subDoc.data();
+    if (subData.plan !== 'pay_as_you_go') return { success: true }; // Not a token lab
+    
+    let amount = 0;
+    if (typeof taskKeyOrAmount === 'number') {
+      amount = taskKeyOrAmount;
+    } else {
+      // Fetch plan config for dynamic price
+      const planDoc = await db.collection('plans').doc('pay_as_you_go').get();
+      const planData = planDoc.exists ? planDoc.data() : {};
+      const config = planData.tokenConfig || {
+        reportFinalization: 1,
+        staffCreation: 20,
+        dailyReport: 1,
+        ledgerAction: 1
+      };
+      
+      amount = config[taskKeyOrAmount] || 1; // Default to 1 if key missing
+    }
+
+    const currentBalance = subData.tokenBalance || 0;
+    if (currentBalance < amount) {
+      return { success: false, error: `Insufficient tokens (Balance: ${currentBalance}, Required: ${amount})` };
+    }
+    
+    // Atomic update
+    await subRef.update({
+      tokenBalance: admin.firestore.FieldValue.increment(-amount),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+    
+    // Log transaction
+    await db.collection('tokenLogs').add({
+      labId: String(labId),
+      amount: amount,
+      reason: reason,
+      taskKey: typeof taskKeyOrAmount === 'string' ? taskKeyOrAmount : 'direct',
+      timestamp: admin.firestore.FieldValue.serverTimestamp()
+    });
+    
+    return { success: true, newBalance: currentBalance - amount };
+  } catch (error) {
+    console.error('[Token Error]', error);
+    return { success: false, error: error.message };
   }
 };
 
@@ -211,7 +277,9 @@ const secureSyncHandler = async (collection, prefix, req, res, versioning = fals
        }
        
        // Automated Status Mapping Engine (Overrides Client UI Inputs securely)
-       if (mergedState.reported_at) {
+       if (mergedState.status === 'Delivered' || data.status === 'Delivered') {
+           data.status = 'Delivered';
+       } else if (mergedState.reported_at || data.status === 'Final' || mergedState.status === 'Final') {
            data.status = 'Final';
        } else if (mergedState.results && mergedState.results.length > 0) {
            data.status = 'In Progress';
@@ -222,6 +290,17 @@ const secureSyncHandler = async (collection, prefix, req, res, versioning = fals
        // Generate a high-entropy viewToken for public QR access if it doesn't exist
        if (!mergedState.viewToken) {
            data.viewToken = crypto.randomBytes(24).toString('hex');
+       }
+
+       // --- PAY AS YOU GO TOKEN DEDUCTION (Report Finalization) ---
+       if (data.status === 'Final' && (!currentDoc.exists || currentDoc.data().status !== 'Final')) {
+           const labId = data.labId || (currentDoc.exists ? currentDoc.data().labId : null);
+           if (labId) {
+               const deduction = await deductTokens(labId, 'reportFinalization', `Report Finalized: ${finalId}`);
+               if (!deduction.success) {
+                   return res.status(403).json({ error: deduction.error });
+               }
+           }
        }
     }
 
@@ -629,6 +708,16 @@ app.post('/api/auth/staff', authenticateJWT, verifyLabAdmin, async (req, res) =>
     }
 
     const { plan } = subDoc.data();
+    
+    // --- PAY AS YOU GO TOKEN DEDUCTION ---
+    if (plan === 'pay_as_you_go') {
+      const deduction = await deductTokens(labIdStr, 'staffCreation', `Staff Creation: ${name || email}`);
+      if (!deduction.success) {
+        return res.status(403).json({ error: deduction.error });
+      }
+    }
+    // --- END TOKEN DEDUCTION ---
+
     const planDoc = await db.collection('plans').doc(plan || 'basic').get();
     let maxUsers = plan === 'pro' ? 10 : 2; // Fallback defaults
     
@@ -1699,12 +1788,100 @@ app.post('/api/send-daily-report/:labId', authenticateJWT, async (req, res) => {
     });
 
     console.log(`[Manual Report] Daily Report sent successfully for Lab ${labId} to ${recipientEmail}`);
+    
+    // --- PAY AS YOU GO TOKEN DEDUCTION ---
+    const deduction = await deductTokens(labId, 'dailyReport', `Daily Report Sent (Manual)`);
+    if (!deduction.success) {
+      return res.status(403).json({ error: deduction.error }); // This rarely fails here since it sent already, but good for balance sync
+    }
+    // --- END TOKEN DEDUCTION ---
+
     res.json({ success: true, message: `Report sent successfully to ${recipientEmail}` });
 
   } catch (err) {
     console.error('[Manual Report Error]', err.message);
     res.status(500).json({ error: err.message || 'Failed to send daily report' });
   }
+});
+
+// --- TOKEN MANAGEMENT ENDPOINTS ---
+
+// Generic endpoint to deduct 1 token for manual actions (like Printing/Emailing Ledger)
+app.post('/api/tokens/deduct-action', authenticateJWT, checkSubscription, async (req, res) => {
+    const { action, labId } = req.body;
+    const targetLabId = req.user.role === 'SuperAdmin' ? labId : req.user.labId;
+    
+    if (!targetLabId) return res.status(400).json({ error: "Missing Lab ID" });
+    
+    const deduction = await deductTokens(targetLabId, 'ledgerAction', action || 'Generic Action');
+    if (!deduction.success) {
+        return res.status(403).json({ error: deduction.error });
+    }
+    
+    res.json({ success: true, balance: deduction.newBalance });
+});
+
+// Request Tokens (LabAdmin)
+app.post('/api/tokens/request', authenticateJWT, checkSubscription, async (req, res) => {
+    const { requestedAmount } = req.body;
+    if (!requestedAmount || requestedAmount <= 0) return res.status(400).json({ error: "Invalid amount" });
+    
+    try {
+        await db.collection('tokenRequests').add({
+            labId: String(req.user.labId),
+            requestedAmount: parseInt(requestedAmount),
+            status: 'pending',
+            createdAt: admin.firestore.FieldValue.serverTimestamp(),
+            createdBy: req.user.uid,
+            labName: req.subscription.labName || 'Unknown Lab'
+        });
+        res.json({ success: true, message: "Token request submitted to Super Admin" });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// List Token Requests (SuperAdmin)
+app.get('/api/superadmin/token-requests', authenticateJWT, isSuperAdmin, async (req, res) => {
+    try {
+        const snap = await db.collection('tokenRequests').orderBy('createdAt', 'desc').limit(50).get();
+        const requests = snap.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+        res.json(requests);
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Add Tokens / Approve Request (SuperAdmin)
+app.post('/api/superadmin/add-tokens', authenticateJWT, isSuperAdmin, async (req, res) => {
+    const { labId, amount, requestId } = req.body;
+    if (!labId || !amount) return res.status(400).json({ error: "Missing labId or amount" });
+    
+    try {
+        const subRef = db.collection('subscriptions').doc(String(labId));
+        await subRef.set({
+            tokenBalance: admin.firestore.FieldValue.increment(parseInt(amount)),
+            updatedAt: admin.firestore.FieldValue.serverTimestamp()
+        }, { merge: true });
+        
+        // Log top-up
+        await db.collection('tokenLogs').add({
+            labId: String(labId),
+            amount: parseInt(amount),
+            reason: 'Token Top-up (SuperAdmin Approved)',
+            timestamp: admin.firestore.FieldValue.serverTimestamp(),
+            approvedBy: req.user.uid
+        });
+        
+        // Update request status if provided
+        if (requestId) {
+            await db.collection('tokenRequests').doc(requestId).update({ status: 'approved', updatedAt: admin.firestore.FieldValue.serverTimestamp() });
+        }
+        
+        res.json({ success: true, message: `Successfully added ${amount} tokens to Lab ${labId}` });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
 });
 
 // START SERVER
@@ -1863,6 +2040,9 @@ cron.schedule('* * * * *', async () => {
           'reportSettings.dailyReport.lastSent': admin.firestore.FieldValue.serverTimestamp(),
           'reportSettings.dailyReport.lastStatus': 'Success'
         });
+
+        // --- PAY AS YOU GO TOKEN DEDUCTION ---
+        await deductTokens(labId, 'dailyReport', `Daily Report Sent (Automated)`);
 
         console.log(`[Cron] Daily Report sent successfully for Lab ${labId} to ${recipientEmail}`);
 
