@@ -5,6 +5,7 @@ const path = require('path');
 require('dotenv').config();
 const cron = require('node-cron');
 const crypto = require('crypto');
+const axios = require('axios');
 
 const app = express();
 app.use(cors());
@@ -291,17 +292,24 @@ const secureSyncHandler = async (collection, prefix, req, res, versioning = fals
        if (!mergedState.viewToken) {
            data.viewToken = crypto.randomBytes(24).toString('hex');
        }
+    }
 
-       // --- PAY AS YOU GO TOKEN DEDUCTION (Report Finalization) ---
-       if (data.status === 'Final' && (!currentDoc.exists || currentDoc.data().status !== 'Final')) {
-           const labId = data.labId || (currentDoc.exists ? currentDoc.data().labId : null);
-           if (labId) {
-               const deduction = await deductTokens(labId, 'reportFinalization', `Report Finalized: ${finalId}`);
-               if (!deduction.success) {
-                   return res.status(403).json({ error: deduction.error });
-               }
-           }
-       }
+    // --- PAY AS YOU GO TOKEN ENFORCEMENT (New Bookings) ---
+    if (collection === 'bookings' && isNew) {
+        const labId = data.labId || data.lab_id;
+        if (labId) {
+            const subDoc = await db.collection('subscriptions').doc(String(labId)).get();
+            if (subDoc.exists) {
+                const subData = subDoc.data();
+                if (subData.plan === 'pay_as_you_go' && (subData.tokenBalance || 0) <= 0) {
+                    return res.status(403).json({ 
+                        error: "Insufficient Tokens", 
+                        code: "OUT_OF_TOKENS",
+                        message: "You have 0 tokens left. Please recharge to continue bookings." 
+                    });
+                }
+            }
+        }
     }
 
     const payload = {
@@ -674,6 +682,157 @@ app.get('/api/auth/me', authenticateJWT, async (req, res) => {
     });
   } catch (error) {
     console.error("Error fetching user data:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// --- SIGNUP OTP VERIFICATION ---
+
+// Helper: Generate 6-digit OTP
+const generateOTP = () => {
+  return Math.floor(100000 + Math.random() * 900000).toString();
+};
+
+// POST /api/auth/check-email
+app.post('/api/auth/check-email', async (req, res) => {
+  const { email } = req.body;
+  if (!email) return res.status(400).json({ error: "Email is required" });
+
+  console.log(`[CheckEmail] Checking availability for: ${email}`);
+
+  try {
+    // 1. Check Firebase Auth (Source of Truth for Login)
+    try {
+      const user = await admin.auth().getUserByEmail(email);
+      if (user) {
+        console.log(`[CheckEmail] Found in Firebase Auth: ${email}`);
+        return res.json({ 
+          available: false, 
+          reason: 'registered',
+          message: "This email is already registered. Please login instead." 
+        });
+      }
+    } catch (authErr) {
+      if (authErr.code !== 'auth/user-not-found') {
+        console.error(`[CheckEmail] Auth Error:`, authErr.message);
+      }
+    }
+
+    // 2. Check Firestore users collection (Secondary check)
+    const userSnap = await db.collection('users')
+      .where('email', '==', email)
+      .limit(1)
+      .get();
+    
+    if (!userSnap.empty) {
+      console.log(`[CheckEmail] Found in users collection: ${email}`);
+      return res.json({ 
+        available: false, 
+        reason: 'registered',
+        message: "This email is already registered. Please login instead." 
+      });
+    }
+
+    // 3. Check Pending Signup Requests
+    const signupSnap = await db.collection('signupRequests')
+      .where('email', '==', email)
+      .where('status', '==', 'pending')
+      .limit(1)
+      .get();
+
+    if (!signupSnap.empty) {
+      console.log(`[CheckEmail] Found in pending signupRequests: ${email}`);
+      return res.json({ 
+        available: false, 
+        reason: 'pending',
+        message: "A registration request for this email is already pending approval." 
+      });
+    }
+
+    console.log(`[CheckEmail] Email is available: ${email}`);
+    res.json({ available: true });
+  } catch (error) {
+    console.error(`[CheckEmail] Total Error for ${email}:`, error);
+    res.status(500).json({ error: "Error checking email availability" });
+  }
+});
+
+// POST /api/auth/send-signup-otp
+app.post('/api/auth/send-signup-otp', async (req, res) => {
+  const { email, labName } = req.body;
+  if (!email) return res.status(400).json({ error: "Email is required" });
+
+  try {
+    const otp = generateOTP();
+    const expiry = new Date();
+    expiry.setMinutes(expiry.getMinutes() + 10); // 10 minutes expiry
+
+    // Save/Update OTP in Firestore
+    await db.collection('verificationOtps').doc(email).set({
+      email,
+      otp,
+      expiry: admin.firestore.Timestamp.fromDate(expiry),
+      createdAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+
+    // Send Email
+    const emailHtml = `
+      <div style="font-family: sans-serif; max-width: 500px; margin: auto; padding: 20px; border: 1px solid #eee; border-radius: 10px;">
+        <h2 style="color: #0f172a; text-align: center;">Verify Your Email</h2>
+        <p>Hello,</p>
+        <p>Your verification code for <b>${labName || 'Lab Mitra'}</b> registration is:</p>
+        <div style="background: #f1f5f9; padding: 20px; text-align: center; font-size: 32px; font-weight: 900; letter-spacing: 5px; color: #0f172a; border-radius: 8px; margin: 20px 0;">
+          ${otp}
+        </div>
+        <p style="color: #64748b; font-size: 13px;">This code will expire in 10 minutes. If you did not request this, please ignore this email.</p>
+        <hr style="border: none; border-top: 1px solid #eee; margin: 20px 0;" />
+        <p style="text-align: center; color: #94a3b8; font-size: 11px;">Powered by Lab Mitra</p>
+      </div>
+    `;
+
+    await sendServerEmail({
+      to: email,
+      subject: `Verification Code: ${otp}`,
+      html: emailHtml,
+      labName: labName || 'Lab Mitra'
+    });
+
+    res.json({ success: true, message: "OTP sent to your email" });
+  } catch (error) {
+    console.error("Send Signup OTP Error:", error);
+    res.status(500).json({ error: "Failed to send OTP. Please try again." });
+  }
+});
+
+// POST /api/auth/verify-signup-otp
+app.post('/api/auth/verify-signup-otp', async (req, res) => {
+  const { email, otp } = req.body;
+  if (!email || !otp) return res.status(400).json({ error: "Email and OTP are required" });
+
+  try {
+    const otpDoc = await db.collection('verificationOtps').doc(email).get();
+    if (!otpDoc.exists) {
+      return res.status(400).json({ error: "OTP expired or not found. Please request a new one." });
+    }
+
+    const data = otpDoc.data();
+    const now = new Date();
+
+    if (now > data.expiry.toDate()) {
+      await db.collection('verificationOtps').doc(email).delete();
+      return res.status(400).json({ error: "OTP has expired. Please request a new one." });
+    }
+
+    if (data.otp !== otp) {
+      return res.status(400).json({ error: "Invalid OTP code. Please check and try again." });
+    }
+
+    // Success: Delete OTP document
+    await db.collection('verificationOtps').doc(email).delete();
+
+    res.json({ success: true, message: "Email verified successfully" });
+  } catch (error) {
+    console.error("Verify Signup OTP Error:", error);
     res.status(500).json({ error: "Internal server error" });
   }
 });
@@ -1262,7 +1421,9 @@ app.post('/api/superadmin/register-lab', authenticateJWT, isSuperAdmin, async (r
     const tempPassword = `Lab@${Math.floor(1000 + Math.random() * 9000)}`;
 
     const expiry = new Date();
-    expiry.setMonth(expiry.getMonth() + parseInt(months || 12));
+    // For Pay As You Go, set a "Life-time" validity of 100 years (1200 months)
+    const effectiveMonths = plan === 'pay_as_you_go' ? 1200 : parseInt(months || 12);
+    expiry.setMonth(expiry.getMonth() + effectiveMonths);
     const expiryDate = expiry.toISOString().split('T')[0];
     const expiryTimestamp = admin.firestore.Timestamp.fromDate(expiry);
     const today = new Date().toISOString().split('T')[0];
@@ -1321,6 +1482,24 @@ app.post('/api/superadmin/register-lab', authenticateJWT, isSuperAdmin, async (r
       labId: labId,
       createdAt: admin.firestore.FieldValue.serverTimestamp()
     });
+
+    // 6. Send Welcome Email with full lab details
+    try {
+      const welcomeHtml = buildWelcomeEmailHtml({
+        labName, ownerName, email, tempPassword, labId, licenseKey,
+        plan: plan || 'basic', expiryDate, phone, address, city, state, pincode
+      });
+      await sendServerEmail({
+        to: email,
+        subject: `Welcome to Lab Mitra - Your Lab Account is Ready!`,
+        html: welcomeHtml,
+        labName: 'Lab Mitra'
+      });
+      console.log(`[Register] Welcome email sent to ${email}`);
+    } catch (emailErr) {
+      console.error('[Register] Welcome email failed:', emailErr.message);
+      // Don't fail registration if email fails
+    }
 
     res.json({
       success: true,
@@ -1508,73 +1687,18 @@ app.post('/api/send-notification', authenticateJWT, async (req, res) => {
     // Generate standard HTML template only if custom reportHtml is not provided
     const emailHtml = reportHtml || buildEmailHtml({ patientName, labName, bookingId, testsFormatted, reportUrl });
 
-    // 2. Route to the correct provider
-    if (provider === 'resend') {
-      // ── RESEND API ──
-      if (!resendApiKey) {
-        return res.status(500).json({ error: 'Resend API Key not configured.' });
-      }
+    // 2. Send via Unified Helper
+    const result = await sendServerEmail({
+      to,
+      subject: subject || (pdfBase64 || reportHtml 
+        ? `Pathology Report - ${patientName} (${labName || 'Lab'})`
+        : `Your Lab Report is Ready - ${labName || 'Lab Mitra'}`),
+      html: emailHtml,
+      labName,
+      pdfBase64
+    });
 
-      const resendResponse = await fetch('https://api.resend.com/emails', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${resendApiKey}`
-        },
-        body: JSON.stringify({
-          from: `${labName || 'Lab Mitra'} <onboarding@resend.dev>`,
-          to: [to],
-          subject: subject || `Your Lab Report is Ready - ${labName || 'Lab Mitra'}`,
-          html: emailHtml
-        })
-      });
-
-      const resendData = await resendResponse.json();
-      if (!resendResponse.ok) {
-        console.error('Resend Error:', resendData);
-        return res.status(500).json({ error: 'Resend delivery failed', details: resendData });
-      }
-
-      return res.json({ success: true, provider: 'resend', messageId: resendData.id });
-
-    } else {
-      // ── GOOGLE APPS SCRIPT (GAS) ──
-      if (!gasUrl) {
-        return res.status(500).json({ error: 'GAS URL not configured.' });
-      }
-
-      const gasPayload = {
-        action: pdfBase64 ? "SEND_PDF_BASE64" : (reportHtml ? "SEND_REPORT_PDF" : "SEND_EMAIL_HTML"),
-        email: to,
-        patientName: patientName,
-        subject: subject || (pdfBase64 || reportHtml 
-          ? `Pathology Report - ${patientName} (${labName || 'Lab'})`
-          : `Your Lab Report is Ready - ${labName || 'Lab Mitra'}`),
-        html: emailHtml,
-        pdfBase64: pdfBase64
-      };
-
-      console.log('Sending to GAS:', JSON.stringify({ ...gasPayload, html: 'HTML_TRUNCATED', pdfBase64: pdfBase64 ? 'BASE64_TRUNCATED' : null }));
-      
-      const gasResponse = await fetch(gasUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        redirect: 'follow',
-        body: JSON.stringify(gasPayload)
-      });
-
-      const gasText = await gasResponse.text();
-      console.log('GAS Raw Response:', gasText);
-      
-      let gasData;
-      try { gasData = JSON.parse(gasText); } catch { gasData = { raw: gasText }; }
-
-      if (!gasResponse.ok) {
-        return res.status(500).json({ error: 'GAS delivery failed', details: gasData });
-      }
-
-      return res.json({ success: true, provider: 'gas', response: gasData });
-    }
+    return res.json({ success: true, result });
 
   } catch (err) {
     console.error('send-notification error:', err);
@@ -1644,6 +1768,364 @@ function buildEmailHtml({ patientName, labName, bookingId, testsFormatted, repor
 </body>
 </html>
   `.trim();
+}
+
+// Helper: Build HTML email for token status updates
+function buildTokenStatusEmailHtml({ labName, adminName, status, requestedAmount, message }) {
+  const isApproved = status.toLowerCase() === 'approved';
+  const statusColor = isApproved ? '#16a34a' : '#e11d48';
+  const statusText = isApproved ? 'Request Approved ✓' : 'Request Rejected ✕';
+
+  return `
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f8fafc; margin: 0; padding: 20px; }
+    .container { max-width: 600px; margin: 0 auto; background: white; border-radius: 32px; overflow: hidden; box-shadow: 0 10px 40px rgba(0,0,0,0.04); border: 1px solid #f1f5f9; }
+    .header { background: #0f172a; padding: 48px 40px; text-align: center; }
+    .header h1 { color: white; margin: 0; font-size: 24px; letter-spacing: -0.5px; text-transform: uppercase; font-weight: 900; }
+    .header p { color: #94a3b8; margin: 8px 0 0; font-size: 11px; letter-spacing: 3px; text-transform: uppercase; font-weight: 700; }
+    .status-badge { display: inline-block; background: ${statusColor}; color: white; padding: 8px 24px; border-radius: 100px; font-size: 11px; font-weight: 900; letter-spacing: 1px; text-transform: uppercase; margin-top: 24px; box-shadow: 0 4px 12px ${statusColor}40; }
+    .body { padding: 48px; }
+    .greeting { font-size: 24px; font-weight: 900; color: #0f172a; margin-bottom: 12px; letter-spacing: -0.5px; }
+    .content { color: #475569; font-size: 15px; line-height: 1.6; margin-bottom: 32px; font-weight: 500; }
+    .info-grid { background: #f8fafc; border: 1px solid #f1f5f9; border-radius: 24px; padding: 32px; margin-bottom: 32px; }
+    .info-item { display: flex; justify-content: space-between; align-items: center; padding: 12px 0; border-bottom: 1px solid #f1f5f9; }
+    .info-item:last-child { border-bottom: none; }
+    .label { font-size: 11px; color: #94a3b8; font-weight: 800; text-transform: uppercase; letter-spacing: 1.5px; }
+    .value { font-size: 14px; color: #0f172a; font-weight: 700; }
+    .footer { background: #f8fafc; padding: 32px; text-align: center; border-top: 1px solid #f1f5f9; }
+    .footer p { margin: 0; font-size: 11px; color: #94a3b8; font-weight: 600; text-transform: uppercase; letter-spacing: 1px; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <h1>${labName}</h1>
+      <p>Laboratory Management</p>
+      <div class="status-badge">${statusText}</div>
+    </div>
+    <div class="body">
+      <div class="greeting">Hello, ${adminName}</div>
+      <div class="content">
+        ${message}
+      </div>
+      <div class="info-grid">
+        <div class="info-item">
+          <span class="label">Token Amount</span>
+          <span class="value">${requestedAmount} Tokens</span>
+        </div>
+        <div class="info-item">
+          <span class="label">Status</span>
+          <span class="value" style="color: ${statusColor};">${status.toUpperCase()}</span>
+        </div>
+      </div>
+      <p style="text-align: center; color: #94a3b8; font-size: 12px; margin: 0;">
+        You can now view your updated balance in your dashboard.
+      </p>
+    </div>
+    <div class="footer">
+      <p>Automated message from Lab Mitra • SuperAdmin Action</p>
+    </div>
+  </div>
+</body>
+</html>`;
+}
+
+// Helper: Build Welcome Email for newly registered labs
+function buildWelcomeEmailHtml({ labName, ownerName, email, tempPassword, labId, licenseKey, plan, expiryDate, phone, address, city, state, pincode }) {
+  const fullAddress = [address, city, state, pincode].filter(Boolean).join(', ') || 'Not Provided';
+  const planLabel = (plan || 'basic').replace(/_/g, ' ').toUpperCase();
+  const formattedExpiry = expiryDate ? expiryDate.split('-').reverse().join('/') : 'N/A';
+
+  return `
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f0f4f8; margin: 0; padding: 20px; }
+    .container { max-width: 640px; margin: 0 auto; background: white; border-radius: 32px; overflow: hidden; box-shadow: 0 20px 60px rgba(0,0,0,0.06); border: 1px solid #e2e8f0; }
+    .header { background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%); padding: 48px 40px; text-align: center; }
+    .header h1 { color: white; margin: 0; font-size: 28px; letter-spacing: -0.5px; font-weight: 900; text-transform: uppercase; }
+    .header p { color: #94a3b8; margin: 8px 0 0; font-size: 11px; letter-spacing: 3px; text-transform: uppercase; font-weight: 700; }
+    .welcome-badge { display: inline-block; background: #a3e635; color: #0f172a; padding: 8px 28px; border-radius: 100px; font-size: 11px; font-weight: 900; letter-spacing: 2px; text-transform: uppercase; margin-top: 20px; box-shadow: 0 4px 12px rgba(163,230,53,0.3); }
+    .body { padding: 48px 40px; }
+    .greeting { font-size: 24px; font-weight: 900; color: #0f172a; margin-bottom: 8px; letter-spacing: -0.5px; }
+    .subtitle { color: #64748b; font-size: 15px; line-height: 1.6; margin-bottom: 32px; }
+    .section-title { font-size: 10px; font-weight: 900; color: #94a3b8; text-transform: uppercase; letter-spacing: 2px; margin-bottom: 12px; margin-top: 32px; padding-bottom: 8px; border-bottom: 2px solid #f1f5f9; }
+    .info-card { background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 20px; padding: 24px; margin-bottom: 16px; }
+    .info-row { display: flex; justify-content: space-between; align-items: center; padding: 10px 0; border-bottom: 1px solid #f1f5f9; }
+    .info-row:last-child { border-bottom: none; }
+    .label { font-size: 11px; color: #94a3b8; font-weight: 800; text-transform: uppercase; letter-spacing: 1.5px; }
+    .value { font-size: 14px; color: #0f172a; font-weight: 700; text-align: right; max-width: 60%; }
+    .credential-card { background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%); border-radius: 20px; padding: 28px; margin-bottom: 16px; }
+    .cred-row { display: flex; justify-content: space-between; align-items: center; padding: 10px 0; border-bottom: 1px solid rgba(255,255,255,0.08); }
+    .cred-row:last-child { border-bottom: none; }
+    .cred-label { font-size: 11px; color: #94a3b8; font-weight: 800; text-transform: uppercase; letter-spacing: 1.5px; }
+    .cred-value { font-size: 14px; color: #a3e635; font-weight: 700; font-family: 'Courier New', monospace; letter-spacing: 1px; }
+    .warning { background: #fffbeb; border: 1px solid #fde68a; border-radius: 12px; padding: 16px; margin-top: 24px; font-size: 12px; color: #92400e; line-height: 1.6; }
+    .warning strong { color: #78350f; }
+    .footer { background: #f8fafc; padding: 28px 40px; text-align: center; border-top: 1px solid #f1f5f9; }
+    .footer p { margin: 0; font-size: 11px; color: #94a3b8; font-weight: 600; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <h1>Lab Mitra</h1>
+      <p>Laboratory Management Platform</p>
+      <div class="welcome-badge">Welcome Aboard ✓</div>
+    </div>
+    <div class="body">
+      <div class="greeting">Hello, ${ownerName || 'Admin'}!</div>
+      <div class="subtitle">Your laboratory account has been successfully created. Below are your complete registration details and login credentials.</div>
+
+      <div class="section-title">🔐 Login Credentials</div>
+      <div class="credential-card">
+        <div class="cred-row">
+          <span class="cred-label">Email</span>
+          <span class="cred-value">${email}</span>
+        </div>
+        <div class="cred-row">
+          <span class="cred-label">Password</span>
+          <span class="cred-value">${tempPassword}</span>
+        </div>
+      </div>
+
+      <div class="section-title">🏥 Lab Profile</div>
+      <div class="info-card">
+        <div class="info-row">
+          <span class="label">Lab Name</span>
+          <span class="value">${labName}</span>
+        </div>
+        <div class="info-row">
+          <span class="label">Owner / Admin</span>
+          <span class="value">${ownerName || 'N/A'}</span>
+        </div>
+        <div class="info-row">
+          <span class="label">Contact</span>
+          <span class="value">${phone || 'N/A'}</span>
+        </div>
+        <div class="info-row">
+          <span class="label">Lab ID</span>
+          <span class="value">${labId}</span>
+        </div>
+      </div>
+
+      <div class="section-title">📍 Facility Address</div>
+      <div class="info-card">
+        <div class="info-row">
+          <span class="label">Address</span>
+          <span class="value">${fullAddress}</span>
+        </div>
+      </div>
+
+      <div class="section-title">📋 Subscription Details</div>
+      <div class="info-card">
+        <div class="info-row">
+          <span class="label">Plan</span>
+          <span class="value">${planLabel}</span>
+        </div>
+        <div class="info-row">
+          <span class="label">License Key</span>
+          <span class="value" style="font-family: 'Courier New', monospace; font-size: 12px;">${licenseKey}</span>
+        </div>
+        <div class="info-row">
+          <span class="label">Valid Until</span>
+          <span class="value">${formattedExpiry}</span>
+        </div>
+      </div>
+
+      <div class="warning">
+        <strong>⚠ Important:</strong> Please change your password after your first login for security purposes. Go to Settings → Change Password once logged in.
+      </div>
+    </div>
+    <div class="footer">
+      <p>This is an automated welcome email from Lab Mitra • Do not reply</p>
+    </div>
+  </div>
+</body>
+</html>`.trim();
+}
+
+// Helper: Build HTML email for Super Admin Signup Alerts
+function buildAdminSignupAlertHtml({ labName, ownerName, email, phone, plan }) {
+  const planLabel = (plan || 'basic').replace(/_/g, ' ').toUpperCase();
+  const timestamp = new Date().toLocaleString('en-GB', { 
+    day: '2-digit', month: 'long', year: 'numeric', 
+    hour: '2-digit', minute: '2-digit', hour12: true 
+  });
+
+  return `
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #fdf2f2; margin: 0; padding: 20px; }
+    .container { max-width: 600px; margin: 0 auto; background: white; border-radius: 32px; overflow: hidden; box-shadow: 0 20px 50px rgba(0,0,0,0.08); border: 1px solid #fee2e2; }
+    .header { background: #991b1b; padding: 48px 40px; text-align: center; }
+    .header h1 { color: white; margin: 0; font-size: 22px; letter-spacing: 2px; text-transform: uppercase; font-weight: 900; }
+    .header p { color: #fecaca; margin: 8px 0 0; font-size: 11px; letter-spacing: 3px; text-transform: uppercase; font-weight: 700; }
+    .alert-badge { display: inline-block; background: #ef4444; color: white; padding: 8px 24px; border-radius: 100px; font-size: 11px; font-weight: 900; letter-spacing: 1px; text-transform: uppercase; margin-top: 24px; box-shadow: 0 4px 12px rgba(239,68,68,0.3); }
+    .body { padding: 48px; }
+    .greeting { font-size: 24px; font-weight: 900; color: #1e293b; margin-bottom: 32px; letter-spacing: -0.5px; }
+    .info-grid { background: #fffcfc; border: 1px solid #fee2e2; border-radius: 24px; padding: 32px; margin-bottom: 24px; }
+    .info-item { display: flex; justify-content: space-between; align-items: center; padding: 14px 0; border-bottom: 1px solid #fee2e2; }
+    .info-item:last-child { border-bottom: none; }
+    .label { font-size: 11px; color: #94a3b8; font-weight: 800; text-transform: uppercase; letter-spacing: 1.5px; }
+    .value { font-size: 14px; color: #1e293b; font-weight: 700; }
+    .cta-note { text-align: center; color: #64748b; font-size: 13px; margin-top: 32px; line-height: 1.6; }
+    .footer { background: #fef2f2; padding: 32px; text-align: center; border-top: 1px solid #fee2e2; }
+    .footer p { margin: 0; font-size: 11px; color: #991b1b; font-weight: 700; text-transform: uppercase; letter-spacing: 1px; opacity: 0.6; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <h1>New Lab Registration Request</h1>
+      <p>System Alert • Internal Only</p>
+      <div class="alert-badge">Action Required</div>
+    </div>
+    <div class="body">
+      <div class="greeting">Hello Admin,</div>
+      <div class="info-grid">
+        <div class="info-item">
+          <span class="label">Lab Name</span>
+          <span class="value">${labName}</span>
+        </div>
+        <div class="info-item">
+          <span class="label">Owner Name</span>
+          <span class="value">${ownerName}</span>
+        </div>
+        <div class="info-item">
+          <span class="label">Email</span>
+          <span class="value">${email}</span>
+        </div>
+        <div class="info-item">
+          <span class="label">Phone</span>
+          <span class="value">${phone}</span>
+        </div>
+        <div class="info-item">
+          <span class="label">Plan Request</span>
+          <span class="value" style="color: #ef4444;">${planLabel}</span>
+        </div>
+        <div class="info-item" style="border-top: 2px solid #fee2e2; margin-top: 10px; padding-top: 20px;">
+          <span class="label">Request Time</span>
+          <span class="value" style="font-size: 12px; color: #64748b;">${timestamp}</span>
+        </div>
+      </div>
+      <div class="cta-note">
+        This request has been added to your signupRequests collection. Please review and approve/reject the account as soon as possible.
+      </div>
+    </div>
+    <div class="footer">
+      <p>Lab Mitra • Cloud Security Alert v4.2</p>
+    </div>
+  </div>
+</body>
+</html>`;
+}
+
+// ─── ADMIN NOTIFICATION ENDPOINT ──────────────────────────────────────────
+// POST /api/signup/notify-admin
+// Called when a new signupRequest is submitted to alert the Super Admin
+app.post('/api/signup/notify-admin', async (req, res) => {
+  try {
+    const { labName, ownerName, email, phone, plan } = req.body;
+    
+    // 1. Fetch all Super Admins
+    const adminsSnap = await db.collection('users').where('role', '==', 'SuperAdmin').get();
+    if (adminsSnap.empty) {
+      console.warn('[NotifyAdmin] No SuperAdmins found in system.');
+      return res.json({ success: true, message: 'No admins to notify' });
+    }
+
+    const alertHtml = buildAdminSignupAlertHtml({ labName, ownerName, email, phone, plan });
+    
+    // 2. Send emails to all admins
+    let notificationCount = 0;
+    const promises = adminsSnap.docs.map(async (doc) => {
+      const adminData = doc.data();
+      if (adminData.email) {
+        await sendServerEmail({
+          to: adminData.email,
+          subject: `🚨 Action Required: New Lab Registration (${labName})`,
+          html: alertHtml,
+          labName: 'Lab Mitra Alert'
+        });
+        notificationCount++;
+      }
+    });
+
+    await Promise.all(promises);
+    console.log(`[NotifyAdmin] Sent alerts to ${notificationCount} admins for ${labName}`);
+    res.json({ success: true, notificationsSent: notificationCount });
+
+  } catch (err) {
+    console.error('[NotifyAdmin Error]', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Internal Helper: Send Email via Resend or GAS
+async function sendServerEmail({ to, subject, html, labName, pdfBase64 }) {
+  try {
+    let provider = 'gas';
+    let gasUrl = process.env.GAS_API_KEY;
+    let resendApiKey = process.env.RESEND_API_KEY;
+
+    try {
+      const globalSettingsDoc = await db.collection('settings').doc('global').get();
+      if (globalSettingsDoc.exists) {
+        const gData = globalSettingsDoc.data();
+        provider = gData.emailProvider || 'gas';
+        if (gData.gasUrl) gasUrl = gData.gasUrl;
+        if (gData.resendApiKey) resendApiKey = gData.resendApiKey;
+      }
+    } catch (e) {
+      console.warn('Email config fetch failed, using fallback.');
+    }
+
+    if (provider === 'resend' && resendApiKey) {
+      const response = await axios.post('https://api.resend.com/emails', {
+        from: `${labName || 'Lab Mitra'} <onboarding@resend.dev>`,
+        to: [to],
+        subject: subject,
+        html: html
+      }, {
+        headers: { 'Authorization': `Bearer ${resendApiKey}` }
+      });
+      return response.data;
+    } else if (gasUrl) {
+      const payload = {
+        action: pdfBase64 ? "SEND_PDF_BASE64" : "SEND_EMAIL_HTML",
+        email: to,
+        subject: subject,
+        html: html,
+        pdfBase64: pdfBase64
+      };
+      
+      const response = await axios.post(gasUrl, payload, {
+        headers: { 'Content-Type': 'application/json' },
+        maxRedirects: 5,
+        timeout: 10000 // 10s timeout
+      });
+
+      return response.data;
+    }
+    throw new Error('No email provider configured');
+  } catch (error) {
+    console.error('sendServerEmail Error:', error.message);
+    // If it's a redirect issue or timeout but we're reasonably sure it hit the provider, we log but don't always crash
+    if (error.code === 'ECONNABORTED' || error.response?.status === 302) {
+      return { success: true, partial: true, message: "Request sent but response unclear" };
+    }
+    throw error;
+  }
 }
 
 // ─── MANUAL DAILY REPORT TRIGGER ──────────────────────────────────────────
@@ -1823,17 +2305,46 @@ app.post('/api/tokens/deduct-action', authenticateJWT, checkSubscription, async 
 
 // Request Tokens (LabAdmin)
 app.post('/api/tokens/request', authenticateJWT, checkSubscription, async (req, res) => {
-    const { requestedAmount } = req.body;
+    const { requestedAmount, adminName, adminEmail, adminPhone } = req.body;
     if (!requestedAmount || requestedAmount <= 0) return res.status(400).json({ error: "Invalid amount" });
     
     try {
+        const labId = String(req.user.labId);
+        // Fetch fresh lab data for accurate name and notification email
+        const labDoc = await db.collection('labs').doc(labId).get();
+        const labData = labDoc.exists ? labDoc.data() : {};
+        
+        // Use lab data as primary source if frontend sends placeholders or missing data
+        const finalLabName = labData.labFullName || labData.labName || req.subscription.labName || 'Unknown Lab';
+        
+        // Priority: Real string > Lab Settings > Lab Email > Placeholder
+        let finalAdminEmail = adminEmail;
+        if (!finalAdminEmail || finalAdminEmail === 'N/A' || finalAdminEmail === 'undefined') {
+            finalAdminEmail = labData.reportSettings?.dailyReport?.notificationEmail || labData.email || 'N/A';
+        }
+
+        let finalAdminName = adminName;
+        if (!finalAdminName || finalAdminName === 'Admin' || finalAdminName === 'undefined') {
+            // Using lab names as fallback if ownerName is missing
+            finalAdminName = labData.ownerName || labData.labFullName || labData.labName || 'Admin';
+        }
+
+        let finalAdminPhone = adminPhone;
+        if (!finalAdminPhone || finalAdminPhone === 'N/A' || finalAdminPhone === 'undefined') {
+            finalAdminPhone = labData.phone || labData.mobile || 'N/A';
+        }
+
         await db.collection('tokenRequests').add({
-            labId: String(req.user.labId),
+            labId: labId,
             requestedAmount: parseInt(requestedAmount),
             status: 'pending',
             createdAt: admin.firestore.FieldValue.serverTimestamp(),
             createdBy: req.user.uid,
-            labName: req.subscription.labName || 'Unknown Lab'
+            labName: finalLabName,
+            adminName: finalAdminName,
+            adminEmail: finalAdminEmail,
+            adminPhone: finalAdminPhone,
+            requestTime: new Date().toISOString()
         });
         res.json({ success: true, message: "Token request submitted to Super Admin" });
     } catch (error) {
@@ -1855,15 +2366,22 @@ app.get('/api/superadmin/token-requests', authenticateJWT, isSuperAdmin, async (
 // Add Tokens / Approve Request (SuperAdmin)
 app.post('/api/superadmin/add-tokens', authenticateJWT, isSuperAdmin, async (req, res) => {
     const { labId, amount, requestId } = req.body;
-    if (!labId || !amount) return res.status(400).json({ error: "Missing labId or amount" });
+    console.log(`[Backend-AddTokens] Request from ${req.user.uid} for Lab: ${labId}, Amount: ${amount}, RequestID: ${requestId}`);
+    
+    if (!labId || !amount) {
+        console.error("[Backend-AddTokens] Validation Failed: Missing labId or amount");
+        return res.status(400).json({ error: "Missing labId or amount" });
+    }
     
     try {
+        console.log(`[Backend-AddTokens] Updating subscription for Lab: ${labId}`);
         const subRef = db.collection('subscriptions').doc(String(labId));
         await subRef.set({
             tokenBalance: admin.firestore.FieldValue.increment(parseInt(amount)),
             updatedAt: admin.firestore.FieldValue.serverTimestamp()
         }, { merge: true });
         
+        console.log(`[Backend-AddTokens] Logging transaction...`);
         // Log top-up
         await db.collection('tokenLogs').add({
             labId: String(labId),
@@ -1875,11 +2393,98 @@ app.post('/api/superadmin/add-tokens', authenticateJWT, isSuperAdmin, async (req
         
         // Update request status if provided
         if (requestId) {
+            console.log(`[Backend-AddTokens] Updating request status and sending email for: ${requestId}`);
             await db.collection('tokenRequests').doc(requestId).update({ status: 'approved', updatedAt: admin.firestore.FieldValue.serverTimestamp() });
+            
+            // ── SEND CONFIRMATION EMAIL ──
+            try {
+                const reqDoc = await db.collection('tokenRequests').doc(requestId).get();
+                if (reqDoc.exists) {
+                    const rData = reqDoc.data();
+                    const adminEmail = rData.adminEmail;
+                    const adminName = rData.adminName || 'Admin';
+                    const labName = rData.labName || 'Your Laboratory';
+                    const requestedAmount = rData.requestedAmount || amount;
+
+                    if (adminEmail && adminEmail !== 'N/A') {
+                        const emailHtml = buildTokenStatusEmailHtml({
+                            labName,
+                            adminName,
+                            status: 'Approved',
+                            requestedAmount,
+                            message: `Positive news! Your request for <b>${requestedAmount} tokens</b> has been approved by the Super Admin. Your balance has been updated accordingly.`
+                        });
+
+                        await sendServerEmail({
+                            to: adminEmail,
+                            subject: `Token Request Approved - ${labName}`,
+                            html: emailHtml,
+                            labName: 'Lab Mitra'
+                        });
+                        console.log(`[Backend-AddTokens] Approval email sent to ${adminEmail}`);
+                    }
+                }
+            } catch (emailErr) {
+                console.error("[Backend-AddTokens] Email notification failed:", emailErr.message);
+            }
         }
         
+        console.log(`[Backend-AddTokens] Success!`);
         res.json({ success: true, message: `Successfully added ${amount} tokens to Lab ${labId}` });
     } catch (error) {
+        console.error("[Backend-AddTokens] Logic Error:", error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Reject Token Request (SuperAdmin)
+app.post('/api/superadmin/reject-token-request', authenticateJWT, isSuperAdmin, async (req, res) => {
+    const { requestId } = req.body;
+    if (!requestId) return res.status(400).json({ error: "Missing requestId" });
+    
+    try {
+        console.log(`[Backend-RejectToken] Rejecting request: ${requestId}`);
+        await db.collection('tokenRequests').doc(requestId).update({ 
+            status: 'rejected', 
+            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+            rejectedBy: req.user.uid
+        });
+
+        // ── SEND REJECTION EMAIL ──
+        try {
+            const reqDoc = await db.collection('tokenRequests').doc(requestId).get();
+            if (reqDoc.exists) {
+                const rData = reqDoc.data();
+                const adminEmail = rData.adminEmail;
+                const adminName = rData.adminName || 'Admin';
+                const labName = rData.labName || 'Your Laboratory';
+                const requestedAmount = rData.requestedAmount;
+
+                if (adminEmail && adminEmail !== 'N/A') {
+                    const emailHtml = buildTokenStatusEmailHtml({
+                        labName,
+                        adminName,
+                        status: 'Rejected',
+                        requestedAmount,
+                        message: `We regret to inform you that your request for <b>${requestedAmount} tokens</b> has been rejected by the Super Admin at this time. Please contact support if you believe this is an error.`
+                    });
+
+                    await sendServerEmail({
+                        to: adminEmail,
+                        subject: `Token Request Rejected - ${labName}`,
+                        html: emailHtml,
+                        labName: 'Lab Mitra'
+                    });
+                    console.log(`[Backend-RejectToken] Rejection email sent to ${adminEmail}`);
+                }
+            }
+        } catch (emailErr) {
+            console.error("[Backend-RejectToken] Email notification failed:", emailErr.message);
+        }
+
+        res.json({ success: true, message: "Token request rejected successfully" });
+    } catch (error) {
+        console.error("[Backend-RejectToken] Error:", error);
         res.status(500).json({ error: error.message });
     }
 });
