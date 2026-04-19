@@ -572,19 +572,23 @@ app.get('/api/public/report/:token', async (req, res) => {
         );
         const mergedTestNames = allReports.map(r => r.testName).join(', ');
         
+        const isAllDelivered = allReports.every(r => r.status === 'Delivered');
+        const isAllFinal = allReports.every(r => r.status === 'Final' || r.status === 'Delivered');
+        
         finalReportData = {
            ...allReports[0],
            testName: mergedTestNames,
            results: mergedResults,
-           status: allReports.every(r => r.status === 'Final') ? 'Final' : 'In Progress'
+           status: isAllDelivered ? 'Delivered' : (isAllFinal ? 'Final' : 'In Progress')
         };
       }
     } else {
       finalReportData = await fetchMeta(finalReportData);
     }
     
-    // Safety check: only allow 'Final' reports
-    if (finalReportData.status !== 'Final') {
+    // Safety check: allow 'Final' and 'Delivered' reports
+    const isViewable = finalReportData.status === 'Final' || finalReportData.status === 'Delivered';
+    if (!isViewable) {
       return res.status(403).json({ error: "This report is still being processed and is not yet available for public view." });
     }
 
