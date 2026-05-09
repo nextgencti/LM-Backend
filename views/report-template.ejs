@@ -1,0 +1,312 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Lab Report</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap');
+    body {
+      font-family: 'Inter', sans-serif;
+      background: white;
+      color: #111827;
+      margin: 0;
+      padding: 0;
+      -webkit-print-color-adjust: exact;
+      print-color-adjust: exact;
+    }
+    .report-table, .report-table td, .report-table th { border: none !important; border-collapse: collapse !important; }
+    .widal-grid table { border-collapse: collapse !important; }
+    .widal-grid th, .widal-grid td { border: 1.5px solid #6b7280 !important; }
+    .report-thead { display: table-header-group !important; }
+    .report-tfoot { display: table-footer-group !important; }
+    
+    .watermark-layer { 
+      position: fixed !important; 
+      top: 0 !important; left: 0 !important; width: 100% !important; height: 100% !important;
+      display: flex !important; align-items: center !important; justify-content: center !important;
+      z-index: 9999 !important;
+      pointer-events: none !important;
+    }
+
+    .report-footer {
+      position: fixed !important;
+      bottom: 0 !important;
+      left: 0 !important;
+      right: 0 !important;
+      background: white !important;
+      z-index: 20 !important;
+    }
+    
+    @page { size: A4 portrait; margin: 0; }
+  </style>
+</head>
+<body class="w-full relative bg-white printable-page">
+  <% 
+     const watermark = labProfile?.reportSettings?.watermark;
+     if (watermark?.enabled !== false && (watermark?.enabled || watermark?.text || watermark?.image)) { 
+  %>
+    <div class="watermark-layer">
+      <% if (watermark.type === 'image' && watermark.image) { %>
+        <img 
+          src="<%= watermark.image %>" 
+          alt="Watermark" 
+          style="opacity: <%= watermark.opacity || 0.1 %>; width: 60%; height: auto; object-fit: contain; transform: rotate(<%= watermark.rotation || 0 %>deg);"
+        />
+      <% } else { %>
+        <div 
+          style="transform: rotate(<%= watermark.rotation || -45 %>deg); opacity: <%= watermark.opacity || 0.1 %>; font-size: <%= (watermark.text?.length > 15) ? '60px' : '85px' %>; color: rgba(0,0,0,0.1);" 
+          class="font-black border-[6px] border-gray-900 px-12 py-6 uppercase tracking-[0.4em] whitespace-nowrap text-center"
+        >
+          <%= watermark.text || 'LAB MITRA' %>
+        </div>
+      <% } %>
+    </div>
+  <% } %>
+
+  <table class="w-full report-table z-10 relative">
+    <thead class="report-thead">
+      <tr><td class="p-0 border-0">
+        <div class="relative bg-white <%= labProfile?.reportSettings?.headerMode === 'none' ? 'h-[1.5cm] sm:h-[2cm]' : '' %>">
+          
+          <% if (labProfile?.reportSettings?.headerMode === 'custom' && labProfile?.reportSettings?.headerImage) { %>
+            <div class="w-full">
+              <img src="<%= labProfile.reportSettings.headerImage %>" alt="Lab Header" class="w-full h-auto object-contain" />
+            </div>
+          <% } else if (labProfile?.reportSettings?.headerMode === 'text') { %>
+             <div class="flex flex-col sm:flex-row justify-between items-start bg-white gap-6 px-6 py-6 border-b-[3px] border-emerald-900">
+                <div class="max-w-md w-full">
+                  <h1 class="text-2xl sm:text-4xl font-black text-emerald-900 uppercase tracking-tighter leading-none mb-3">
+                    <%= labProfile?.labFullName || labProfile?.labName || 'Diagnostic Laboratory' %>
+                  </h1>
+                  <div class="space-y-1">
+                    <% if (labProfile?.reportSettings?.showAddress !== false && labProfile?.address) { %>
+                      <p class="text-[11px] sm:text-sm font-bold text-gray-700 flex items-center">
+                         <span class="leading-tight"><%= labProfile.address %></span>
+                      </p>
+                    <% } %>
+                    <% if (labProfile?.reportSettings?.showPhone !== false && (labProfile?.phone || labProfile?.mobile)) { %>
+                      <p class="text-[11px] sm:text-sm font-bold text-gray-700 flex items-center">
+                         <%= labProfile.phone || labProfile.mobile %>
+                      </p>
+                    <% } %>
+                    <% if (labProfile?.reportSettings?.showEmail !== false && labProfile?.email) { %>
+                      <p class="text-[11px] sm:text-sm font-bold text-gray-700 flex items-center">
+                         <%= labProfile.email %>
+                      </p>
+                    <% } %>
+                  </div>
+                </div>
+                <div class="text-right bg-white self-end sm:self-start">
+                  <div class="bg-emerald-50 border border-emerald-200 px-3 sm:px-4 py-1.5 sm:py-2 rounded-xl mb-2 inline-block">
+                    <h2 class="text-base sm:text-lg font-black text-emerald-900 uppercase tracking-widest m-0 leading-none">Diagnostic Report</h2>
+                  </div>
+                </div>
+              </div>
+          <% } else { %>
+             <div class="w-full h-full min-h-[50px]"></div>
+          <% } %>
+        </div>
+      </td></tr>
+    </thead>
+    
+    <tfoot class="report-tfoot">
+      <tr><td class="p-0 border-0">
+        <div class="w-full <%= labProfile?.reportSettings?.footerMode === 'none' ? 'h-[80px]' : 'h-[150px]' %>"></div>
+      </td></tr>
+    </tfoot>
+
+    <tbody>
+      <tr><td class="p-0 border-0">
+        <div class="flex-grow flex flex-col pb-4 h-full relative z-10 w-full">
+          <section class="px-6 mb-8 mt-6 bg-white">
+            <div class="bg-white border-[1.5px] border-gray-300 rounded-lg p-4 flex flex-row items-stretch justify-between gap-6">
+              <div class="grid grid-cols-[max-content_auto_max-content_auto] gap-x-6 gap-y-0.5 text-[12px] font-bold text-gray-900 flex-1">
+                <div class="text-gray-500 font-medium uppercase tracking-tighter whitespace-nowrap">Name</div> 
+                <div class="uppercase whitespace-nowrap">: <%= reportData.patientName %></div>
+                <div class="text-gray-500 font-medium uppercase tracking-tighter whitespace-nowrap">Reg. Date</div> 
+                <div class="whitespace-nowrap">: <%= formatDate(bookingData?.createdAt || reportData.createdAt, true) %></div>
+                
+                <div class="text-gray-500 font-medium uppercase tracking-tighter whitespace-nowrap">Age/Gender</div> 
+                <div class="whitespace-nowrap">: <%= patientData?.age || reportData.patientAge || '??' %> Y / <%= patientData?.gender || reportData.patientGender || '--' %></div>
+                <div class="text-gray-500 font-medium uppercase tracking-tighter whitespace-nowrap">Received Date</div> 
+                <div class="whitespace-nowrap">: <%= formatDate(bookingData?.receptionDate || reportData.createdAt, true) %></div>
+                
+                <div class="text-gray-500 font-medium uppercase tracking-tighter whitespace-nowrap">Referred By</div> 
+                <div class="uppercase whitespace-nowrap">: <%= doctorData?.name || reportData.doctorName || 'Self' %></div>
+                <div class="text-gray-500 font-medium uppercase tracking-tighter whitespace-nowrap">Collection Date</div> 
+                <div class="whitespace-nowrap">: <%= formatDate(bookingData?.collectionDate || reportData.createdAt, true) %></div>
+                
+                <div class="text-gray-500 font-medium uppercase tracking-tighter whitespace-nowrap">Patient ID</div> 
+                <div class="whitespace-nowrap">: <%= getDisplayId(patientData?.patientId || reportData?.patientId || reportData?.patient_id || patientData?.id) %></div>
+                <div class="text-gray-500 font-medium uppercase tracking-tighter whitespace-nowrap">Report Date</div> 
+                <div class="whitespace-nowrap">: <%= formatDate(reportData.updatedAt || reportData.createdAt, true) %></div>
+                
+                <div class="text-gray-500 font-medium uppercase tracking-tighter whitespace-nowrap">Report ID</div> 
+                <div class="uppercase whitespace-nowrap">: <%= reportData.reportId || reportData.bookingNo || reportData.bookingId || '--' %></div>
+                <div class="text-gray-500 font-medium uppercase tracking-tighter whitespace-nowrap">Status</div> 
+                <div class="text-emerald-700 font-bold uppercase whitespace-nowrap">: <%= ((reportData.status === 'Delivered' || reportData.status === 'Final' || (reportData.results && reportData.results.length > 0)) ? 'Final' : 'In Progress') %></div>
+              </div>
+              <div class="flex flex-col items-center justify-center bg-white pl-6 border-l border-gray-200 shrink-0">
+                <img src="https://api.qrserver.com/v1/create-qr-code/?size=150x150&data=<%= encodeURIComponent(qrUrl) %>" alt="QR Code" class="w-[75px] h-[75px]" />
+                <p class="text-[8px] text-gray-400 text-center mt-1 font-medium tracking-widest uppercase whitespace-nowrap">Scan to Verify</p>
+              </div>
+            </div>
+          </section>
+
+          <section class="px-6 flex-grow bg-white pb-10">
+            <% if (!reportData.results || reportData.results.length === 0) { %>
+               <div class="py-20 text-center border-2 border-dashed border-gray-100 rounded-3xl">
+                  <p class="text-gray-300 font-bold uppercase tracking-widest">No Results Finalized Yet</p>
+               </div>
+            <% } else { %>
+               <div class="flex flex-col gap-6 w-full bg-transparent">
+                 <% if (standardResultsExist) { %>
+                   <div class="overflow-x-auto w-full px-2">
+                     <table class="w-full text-left bg-transparent border-0">
+                       <thead>
+                         <tr class="border-b-[1.5px] border-gray-500 text-gray-900 bg-gray-100">
+                           <th class="py-1 px-2 text-[9px] font-bold uppercase text-slate-500 w-[35%] tracking-tight">Parameter</th>
+                           <th class="py-1 px-2 text-[9px] font-bold uppercase text-slate-500 w-[15%] tracking-tight">Result</th>
+                           <th class="py-1 px-2 text-[9px] font-bold uppercase text-slate-500 w-[10%] text-center tracking-tight">Flag</th>
+                           <th class="py-1 px-2 text-[9px] font-bold uppercase text-slate-500 w-[15%] tracking-tight">Unit</th>
+                           <th class="py-1 px-2 text-[9px] font-bold uppercase text-slate-500 w-[25%] text-right tracking-tight">Ref. Range</th>
+                         </tr>
+                       </thead>
+                     </table>
+                   </div>
+                 <% } %>
+
+                 <% Object.entries(nestedResults).forEach(([testTit, grpData]) => { 
+                      const firstGrp = Object.values(grpData)[0] || [];
+                      const firstP = firstGrp[0] || {};
+                      const catName = firstP._category || 'General';
+                      const samType = firstP._sampleType || 'N/A';
+                 %>
+                      <div class="w-full bg-transparent">
+                        <div class="bg-emerald-50/50 border-l-4 border-emerald-600 px-4 py-1.5 mb-2 flex items-baseline gap-3">
+                           <h2 class="text-[12px] font-bold uppercase text-emerald-900 tracking-tighter shrink-0"><%= testTit %></h2>
+                           <span class="text-[9px] font-bold text-blue-900/50 border-l border-gray-300 pl-3">Category: <%= catName %></span>
+                           <span class="text-[8px] font-medium text-gray-400 uppercase tracking-widest ml-auto">Sample: <%= samType %></span>
+                        </div>
+                        <div class="flex flex-col gap-0 w-full px-2">
+                          <% Object.entries(grpData).forEach(([grpN, params]) => {
+                              const isWid = testTit.toUpperCase().includes('WIDAL') || grpN.toUpperCase().includes('WIDAL');
+                              const isGridTy = params[0]?.dataType === 'Grid' || params[0]?.dataType === 'Titer' || reportData?.reportLayout === 'Tabular table' || isWid;
+                          %>
+                              <div class="mb-0 w-full bg-transparent">
+                                 <% if (grpN && grpN.toUpperCase() !== 'GENERAL') { %>
+                                    <div class="flex items-center gap-2 mt-1 mb-0.5">
+                                       <h4 class="text-[10px] font-bold uppercase text-blue-900/70 bg-slate-50 px-3 py-1 rounded-md border-l-2 border-blue-400 tracking-wider whitespace-nowrap">
+                                          <%= grpN %>
+                                       </h4>
+                                       <div class="h-px bg-slate-100 flex-grow opacity-50"></div>
+                                    </div>
+                                 <% } %>
+
+                                 <% if (isGridTy) { 
+                                      const allT = new Set(); params.forEach(res => { try { Object.keys(JSON.parse(res.value || '{}')).forEach(k => allT.add(k)); } catch(e){} });
+                                      let titrs = Array.from(allT).sort((a,b) => (parseInt(a.split(':')[1])||0) - (parseInt(b.split(':')[1])||0));
+                                      if (isWid) titrs = titrs.length ? titrs.filter(t => (parseInt(t.split(':')[1])||0)<=320) : ["1:20","1:40","1:80","1:160","1:320"];
+                                 %>
+                                   <div class="widal-grid border-[1.5px] border-gray-500 rounded-none overflow-x-auto shadow-sm bg-transparent mt-2 mb-4">
+                                     <table class="w-full text-left bg-transparent">
+                                       <thead><tr class="bg-gray-100 border-b-[1.5px] border-gray-500 text-gray-900">
+                                         <th class="py-2 px-3 text-[9px] font-black uppercase tracking-widest leading-none border-r border-gray-500">Parameter</th>
+                                         <% titrs.forEach((t, idx) => { %>
+                                            <th class="py-2 px-1 text-[9px] font-black uppercase text-center leading-none tracking-tighter border-r border-gray-500"><%= t %></th>
+                                         <% }) %>
+                                       </tr></thead>
+                                       <tbody class="divide-y-[1.5px] divide-gray-500 bg-transparent">
+                                         <% params.forEach(res => { 
+                                              let vm_grid = {}; try { vm_grid = JSON.parse(res.value || '{}'); } catch(e){}
+                                         %>
+                                           <tr class="bg-transparent"><td class="py-1 px-3 text-[10px] font-medium text-gray-800 border-r border-gray-500 leading-none"><%= res.parameter || res.name %></td>
+                                             <% titrs.forEach((t, tidx) => {
+                                                  const v_g = vm_grid[t] || '-'; const isRea_g = v_g.toUpperCase().includes('POS') || v_g.toUpperCase().includes('REA');
+                                             %>
+                                                <td class="py-1 px-1 text-[12px] font-medium text-center <%= isRea_g ? 'text-red-600 font-bold' : 'text-gray-400' %> border-r border-gray-500 leading-none"><%= v_g === 'REACTIVE' ? '+' : v_g %></td>
+                                             <% }) %>
+                                           </tr>
+                                         <% }) %>
+                                       </tbody>
+                                     </table>
+                                   </div>
+                                 <% } else { %>
+                                   <div class="overflow-x-auto w-full">
+                                     <table class="w-full text-left bg-transparent">
+                                       <tbody class="divide-y divide-gray-50 bg-transparent">
+                                         <% params.forEach(res => { 
+                                               const f = getFlag(res.value, res.range); const isAbn = f === 'H' || f === 'L';
+                                         %>
+                                           <tr class="bg-transparent <%= isAbn ? 'font-bold' : '' %>">
+                                             <td class="py-[1px] px-2 text-[11px] <%= isAbn ? 'font-bold text-gray-900' : 'font-medium text-gray-600' %> w-[35%] leading-tight"><%= res.parameter || res.name %></td>
+                                             <td class="py-[1px] px-2 w-[15%] leading-tight">
+                                               <% 
+                                                const valStr = (res.value || '').toUpperCase();
+                                                const isPos = valStr.includes('POSITIVE') || (valStr.includes('REACTIVE') && !valStr.includes('NON-REACTIVE'));
+                                                const isNeg = valStr.includes('NEGATIVE') || valStr.includes('NON-REACTIVE');
+                                                if (isPos) { %><span class="text-[11px] text-rose-600 font-bold"><%= res.value %></span><% }
+                                                else if (isNeg) { %><span class="text-[11px] text-emerald-600 font-bold"><%= res.value %></span><% }
+                                                else { %><span class="text-[11px] <%= isAbn ? (f==='H'?'text-rose-600 font-bold':'text-blue-600 font-bold') : 'text-gray-800 font-medium' %>"><%= res.value || '-' %></span><% }
+                                               %>
+                                             </td>
+                                             <td class="py-[1px] px-2 text-center leading-none w-[10%]"><span class="text-[11px] font-bold <%= isAbn ? (f==='H'?'text-rose-600':'text-blue-600') : 'text-emerald-600' %>"><%= f %></span></td>
+                                             <td class="py-[1px] px-2 text-[10px] font-medium text-slate-500 w-[15%] leading-tight"><%= res.unit || '-' %></td>
+                                             <td class="py-[1px] px-2 text-[10px] text-right tabular-nums w-[25%] <%= isAbn ? 'font-bold text-gray-900 border-gray-100 pl-2' : 'text-gray-500 font-medium' %> leading-tight"><%= res.range || res.normalRange || '-' %></td>
+                                           </tr>
+                                         <% }) %>
+                                       </tbody>
+                                     </table>
+                                   </div>
+                                 <% } %>
+                              </div>
+                          <% }) %>
+                        </div>
+                      </div>
+                 <% }) %>
+               </div>
+
+               <!-- CONCLUSION SECTION: Only appears at the very end of all results -->
+                <div class="flex flex-col items-center bg-white px-2 mt-12 mb-4">
+                  <div class="flex items-center justify-center gap-4 mb-2 w-full">
+                    <div class="h-px w-20 bg-gray-200"></div>
+                    <p class="text-[13px] font-black text-gray-900 tracking-[0.3em] uppercase">End of Report</p>
+                    <div class="h-px w-20 bg-gray-200"></div>
+                  </div>
+                  <div class="w-full pt-2 border-t border-gray-100 text-center">
+                    <p class="text-[10px] text-gray-400 italic font-medium">This is an electronically generated report. Clinical correlation is recommended.</p>
+                    <p class="text-[10px] text-gray-400 mt-1 font-bold uppercase tracking-wider">Printed On: <%= new Date().toLocaleString('en-IN', { dateStyle: 'medium', timeStyle: 'short' }) %></p>
+                  </div>
+                </div>
+            <% } %>
+          </section>
+        </div>
+      </td></tr>
+    </tbody>
+  </table>
+
+  <!-- Repeating Footer for Professional Branding/Signatory - Appears on every page -->
+  <div class="report-footer bg-white z-20 w-full">
+    <% if (labProfile?.reportSettings?.footerMode === 'none') { %>
+      <div class="h-[80px] w-full bg-white"></div>
+    <% } %>
+    <% if (labProfile?.reportSettings?.footerMode === 'custom' && labProfile?.reportSettings?.footerImage) { %>
+      <div class="w-full">
+        <img src="<%= labProfile.reportSettings.footerImage %>" alt="Lab Footer" class="w-full h-auto object-contain" />
+      </div>
+    <% } %>
+    
+    <% if (labProfile?.reportSettings?.footerMode === 'text') { %>
+      <div class="flex justify-between items-end bg-white pt-4 px-6 pb-6">
+        <div class="opacity-70 grayscale"><img src="https://api.qrserver.com/v1/create-qr-code/?size=65x65&data=<%= encodeURIComponent(qrUrl) %>" alt="QR" /></div>
+        <div class="text-right flex flex-col items-end">
+          <div class="w-64 h-[1.5px] bg-gray-800 mb-2"></div>
+          <p class="text-[13px] font-black text-gray-900 uppercase tracking-tighter">Authorized Signatory</p>
+          <p class="text-[10px] text-gray-400 font-bold uppercase tracking-widest mt-0.5">Diagnostic Pathology Dept.</p>
+        </div>
+      </div>
+    <% } %>
+  </div>
+</body>
+</html>

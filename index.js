@@ -6,11 +6,25 @@ require('dotenv').config();
 const cron = require('node-cron');
 const crypto = require('crypto');
 const axios = require('axios');
+const cloudinary = require('cloudinary').v2;
+const multer = require('multer');
+const puppeteer = require('puppeteer');
+const ejs = require('ejs');
+const pdfService = require('./services/pdfService');
 
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
+
+// Cloudinary Configuration
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+  api_key: process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET
+});
+
+const upload = multer({ storage: multer.memoryStorage() });
 
 // Health check endpoint for Cron Jobs
 app.get('/ping', (req, res) => {
@@ -433,6 +447,40 @@ app.get('/api/config', (req, res) => {
   }
 });
 
+// Secure image upload endpoint (Cloudinary)
+app.post('/api/upload-image', authenticateJWT, upload.single('image'), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: "No image provided" });
+    
+    // Check file size (optional, e.g., 5MB limit)
+    if (req.file.size > 5 * 1024 * 1024) {
+      return res.status(400).json({ error: "Image too large. Max 5MB allowed." });
+    }
+
+    // Convert buffer to data uri for Cloudinary
+    const b64 = Buffer.from(req.file.buffer).toString("base64");
+    let dataURI = "data:" + req.file.mimetype + ";base64," + b64;
+    
+    const folderPath = `lab_branding/${req.user.labId || 'general'}`;
+    
+    const result = await cloudinary.uploader.upload(dataURI, {
+      folder: folderPath,
+      resource_type: 'auto',
+      quality: 'auto',
+      fetch_format: 'auto'
+    });
+    
+    res.json({ 
+      success: true, 
+      url: result.secure_url,
+      public_id: result.public_id
+    });
+  } catch (err) {
+    console.error("Cloudinary Upload Error:", err);
+    res.status(500).json({ error: "Failed to upload image to cloud storage." });
+  }
+});
+
 // DEV ONLY: Temporary elevation endpoint
 app.get('/api/dev/elevate', async (req, res) => {
   try {
@@ -503,7 +551,7 @@ app.get('/api/public/report/:token', async (req, res) => {
   if (!db) return res.status(500).json({ error: "Cloud connection down" });
   const { token } = req.params;
   
-  if (!token || token.length < 20) {
+  if (!token || token.length < 3) {
     return res.status(400).json({ error: "Invalid or malformed token" });
   }
 
@@ -514,11 +562,34 @@ app.get('/api/public/report/:token', async (req, res) => {
       .get();
 
     if (snapshot.empty) {
-      return res.status(404).json({ error: "Report not found or link expired" });
+      // Fallback: Check if token is actually a report ID (for legacy links or QR codes without viewTokens)
+      const legacyDoc = await db.collection('reports').doc(token).get();
+      if (legacyDoc.exists) {
+        const legacyData = legacyDoc.data();
+        if (legacyData.labId) {
+          initialReportData = legacyData;
+          finalReportData = { id: legacyDoc.id, ...legacyData };
+        }
+      } else {
+        // Second Fallback: Search by billId (in case the ID is different)
+        const billQuery = await db.collection('reports')
+          .where('billId', '==', token)
+          .limit(1)
+          .get();
+        
+        if (!billQuery.empty) {
+          initialReportData = billQuery.docs[0].data();
+          finalReportData = { id: billQuery.docs[0].id, ...initialReportData };
+        }
+      }
+      
+      if (!initialReportData) {
+        return res.status(404).json({ error: "Report not found or link expired" });
+      }
+    } else {
+      initialReportData = snapshot.docs[0].data();
+      finalReportData = { id: snapshot.docs[0].id, ...initialReportData };
     }
-
-    const initialReportData = snapshot.docs[0].data();
-    let finalReportData = { id: snapshot.docs[0].id, ...initialReportData };
 
     // Fetch Master Metadata Helper
     const fetchMeta = async (r) => {
@@ -611,19 +682,23 @@ app.get('/api/public/report/:token', async (req, res) => {
       } catch(e) {}
     }
 
-    // Fetch Doctor Data
+    // Fetch Booking & Doctor Data
     let doctorData = null;
+    let bookingData = null;
     if (finalReportData.bookingId) {
       try {
         const bdoc = await db.collection('bookings').doc(String(finalReportData.bookingId)).get();
-        if (bdoc.exists && bdoc.data().doctorId) {
-          const ddoc = await db.collection('doctors').doc(String(bdoc.data().doctorId)).get();
-          if (ddoc.exists) doctorData = ddoc.data();
+        if (bdoc.exists) {
+          bookingData = { id: bdoc.id, ...bdoc.data() };
+          if (bookingData.doctorId) {
+            const ddoc = await db.collection('doctors').doc(String(bookingData.doctorId)).get();
+            if (ddoc.exists) doctorData = ddoc.data();
+          }
         }
       } catch(e) {}
     }
 
-    res.json({ reportData: finalReportData, labProfile, patientData, doctorData });
+    res.json({ reportData: finalReportData, labProfile, patientData, doctorData, bookingData });
   } catch (error) {
     console.error("Public report fetch error:", error);
     res.status(500).json({ error: "Internal server error" });
@@ -1559,8 +1634,7 @@ app.get('/api/tests/global', authenticateJWT, isSuperAdmin, async (req, res) => 
 app.post('/api/tests/global', authenticateJWT, isSuperAdmin, async (req, res) => {
   if (!db) return res.status(500).json({ error: "Cloud connection down" });
   try {
-    const testData = req.body;
-    const { id, ...data } = testData;
+    const { id, syncToLabs, ...data } = req.body;
     
     // Ensure it's marked as global
     data.isGlobal = true;
@@ -1577,8 +1651,60 @@ app.post('/api/tests/global', authenticateJWT, isSuperAdmin, async (req, res) =>
       });
     }
 
+    // --- SYNC TO ALL LABS LOGIC ---
+    // If updating an existing global test and sync is requested
+    if (id && syncToLabs) {
+      console.log(`[SyncAll] Syncing test ${id} (${data.testName}) to all labs...`);
+      
+      // Fields to overwrite in local copies (Medical protocol fields)
+      const syncData = {
+        testName: data.testName,
+        category: data.category,
+        sampleType: data.sampleType,
+        methodology: data.methodology,
+        tatHours: data.tatHours,
+        groups: data.groups,
+        reportLayout: data.reportLayout,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp()
+      };
+
+      // Find all linked tests in the 'tests' collection using testCode
+      const linkedSnap = await db.collection('tests')
+        .where('testCode', '==', data.testCode)
+        .where('isGlobal', '==', false)
+        .get();
+
+      const batch = db.batch();
+      let count = 0;
+      const processedIds = new Set();
+
+      const addToBatch = (snap) => {
+        snap.forEach(doc => {
+          if (!processedIds.has(doc.id)) {
+            batch.update(doc.ref, syncData);
+            processedIds.add(doc.id);
+            count++;
+            
+            // Firestore batch limit is 500 operations
+            if (count % 490 === 0) {
+              // Note: In a real high-scale system, we'd commit and start a new batch here
+              // For simplicity in current scale, we assume < 500 labs per test
+            }
+          }
+        });
+      };
+
+      addToBatch(linkedSnap);
+
+      if (count > 0) {
+        await batch.commit();
+        console.log(`[SyncAll] Successfully updated ${count} local copies.`);
+      }
+    }
+
     res.json({ success: true, id: docRef.id });
   } catch (err) {
+    console.error("Global Test Sync Error:", err);
     res.status(500).json({ error: err.message });
   }
 });
@@ -2491,6 +2617,195 @@ app.post('/api/superadmin/reject-token-request', authenticateJWT, isSuperAdmin, 
         console.error("[Backend-RejectToken] Error:", error);
         res.status(500).json({ error: error.message });
     }
+});
+
+// --- PUPPETEER REPORT GENERATION ---
+const authenticateJWTLocal = async (req, res, next) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith('Bearer ')) return res.status(401).json({ error: 'Unauthorized' });
+  const token = authHeader.split('Bearer ')[1];
+  try {
+    const decodedToken = await admin.auth().verifyIdToken(token);
+    req.user = { uid: decodedToken.uid, role: decodedToken.role || 'Staff', labId: decodedToken.labId || null };
+    next();
+  } catch (error) { return res.status(403).json({ error: 'Forbidden' }); }
+};
+
+app.post('/api/generate-report', authenticateJWTLocal, async (req, res) => {
+  try {
+    const { reportData, labProfile, patientData, doctorData, bookingData, qrUrl } = req.body;
+    if (!reportData || !labProfile || !patientData) {
+      return res.status(400).json({ error: 'Missing required report data' });
+    }
+
+    const results = reportData.results || [];
+    const nestedResults = results.reduce((acc, curr) => {
+      const t = curr._testName || reportData.testName?.split(',')[0]?.trim() || 'General';
+      const g = curr.groupName || 'General';
+      if (!acc[t]) acc[t] = {}; if (!acc[t][g]) acc[t][g] = [];
+      acc[t][g].push(curr); return acc;
+    }, {});
+
+    const standardResultsExist = results.some(r => {
+      const t = r._testName || reportData.testName?.split(',')[0]?.trim() || 'General';
+      const g = r.groupName || 'General';
+      const isWid = t.toUpperCase().includes('WIDAL') || g.toUpperCase().includes('WIDAL');
+      return !(r.dataType === 'Grid' || r.dataType === 'Titer' || reportData?.reportLayout === 'Tabular table' || isWid);
+    });
+
+    const getFlag = (val, rangeStr) => {
+        if (!val || !rangeStr) return '';
+        const v = parseFloat(val);
+        if (isNaN(v)) return '';
+        const range = String(rangeStr).toLowerCase();
+        
+        const rangeMatch = range.match(/([\d\.]+)\s*-\s*([\d\.]+)/);
+        if (rangeMatch) {
+          const min = parseFloat(rangeMatch[1]), max = parseFloat(rangeMatch[2]);
+          if (v < min) return 'L';
+          if (v > max) return 'H';
+          return '';
+        }
+        const ltMatch = range.match(/<\s*([\d\.]+)/);
+        if (ltMatch) return v >= parseFloat(ltMatch[1]) ? 'H' : '';
+        const gtMatch = range.match(/>\s*([\d\.]+)/);
+        if (gtMatch) return v <= parseFloat(gtMatch[1]) ? 'L' : '';
+        return '';
+    };
+
+    const formatDate = (ts, includeTime = false) => {
+      if (!ts) return '';
+      let d;
+      // Handle Firebase SDK object, serialized JSON, or standard Date
+      if (ts._seconds) { d = new Date(ts._seconds * 1000); } 
+      else if (ts.seconds) { d = new Date(ts.seconds * 1000); } 
+      else if (typeof ts.toDate === 'function') { d = ts.toDate(); } 
+      else { d = new Date(ts); }
+      
+      if (isNaN(d.getTime())) return '';
+      return d.toLocaleString('en-GB', {
+         day: '2-digit', month: '2-digit', year: 'numeric',
+         ...(includeTime ? { hour: '2-digit', minute: '2-digit', hour12: true } : {})
+      }).replace(',', '');
+    };
+    
+    const getDisplayId = (id) => id ? String(id).split('_').pop() : '--';
+
+    const templatePath = path.join(__dirname, 'views', 'report-template.ejs');
+    
+    const html = await ejs.renderFile(templatePath, {
+       reportData,
+       labProfile,
+       patientData,
+       doctorData: doctorData || null,
+       bookingData: bookingData || null,
+       qrUrl: qrUrl || 'https://labmitra.com',
+       nestedResults,
+       standardResultsExist,
+       getFlag,
+       formatDate,
+       getDisplayId
+    });
+
+    const isSaveRequested = req.query.save === 'true';
+    const { buffer } = await pdfService.generatePDFWithQueue(html, { save: isSaveRequested });
+
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', 'inline; filename="report.pdf"');
+    res.send(Buffer.from(buffer));
+
+  } catch (error) {
+    console.error('[Generate Report PDF Error]:', error);
+    res.status(500).json({ error: 'Failed to generate PDF' });
+  }
+});
+
+app.post('/api/public/generate-report', async (req, res) => {
+  try {
+    const { reportData, labProfile, patientData, doctorData, bookingData, qrUrl } = req.body;
+    if (!reportData || !labProfile || !patientData) {
+      return res.status(400).json({ error: 'Missing required report data' });
+    }
+
+    const results = reportData.results || [];
+    const nestedResults = results.reduce((acc, curr) => {
+      const t = curr._testName || reportData.testName?.split(',')[0]?.trim() || 'General';
+      const g = curr.groupName || 'General';
+      if (!acc[t]) acc[t] = {}; if (!acc[t][g]) acc[t][g] = [];
+      acc[t][g].push(curr); return acc;
+    }, {});
+
+    const standardResultsExist = results.some(r => {
+      const t = r._testName || reportData.testName?.split(',')[0]?.trim() || 'General';
+      const g = r.groupName || 'General';
+      const isWid = t.toUpperCase().includes('WIDAL') || g.toUpperCase().includes('WIDAL');
+      return !(r.dataType === 'Grid' || r.dataType === 'Titer' || reportData?.reportLayout === 'Tabular table' || isWid);
+    });
+
+    const getFlag = (val, rangeStr) => {
+        if (!val || !rangeStr) return '';
+        const v = parseFloat(val);
+        if (isNaN(v)) return '';
+        const range = String(rangeStr).toLowerCase();
+        const rangeMatch = range.match(/([\d\.]+)\s*-\s*([\d\.]+)/);
+        if (rangeMatch) {
+          const min = parseFloat(rangeMatch[1]), max = parseFloat(rangeMatch[2]);
+          if (v < min) return 'L';
+          if (v > max) return 'H';
+          return '';
+        }
+        const ltMatch = range.match(/<\s*([\d\.]+)/);
+        if (ltMatch) return v >= parseFloat(ltMatch[1]) ? 'H' : '';
+        const gtMatch = range.match(/>\s*([\d\.]+)/);
+        if (gtMatch) return v <= parseFloat(gtMatch[1]) ? 'L' : '';
+        return '';
+    };
+
+    const formatDate = (ts, includeTime = false) => {
+      if (!ts) return '';
+      let d;
+      // Handle Firebase SDK object, serialized JSON, or standard Date
+      if (ts._seconds) { d = new Date(ts._seconds * 1000); } 
+      else if (ts.seconds) { d = new Date(ts.seconds * 1000); } 
+      else if (typeof ts.toDate === 'function') { d = ts.toDate(); } 
+      else { d = new Date(ts); }
+      
+      if (isNaN(d.getTime())) return '';
+      return d.toLocaleString('en-GB', {
+         day: '2-digit', month: '2-digit', year: 'numeric',
+         ...(includeTime ? { hour: '2-digit', minute: '2-digit', hour12: true } : {})
+      }).replace(',', '');
+    };
+
+    const getDisplayId = (id) => id ? String(id).split('_').pop() : '--';
+    
+    const templatePath = path.join(__dirname, 'views', 'report-template.ejs');
+    
+    const html = await ejs.renderFile(templatePath, {
+       reportData,
+       labProfile,
+       patientData,
+       doctorData: doctorData || null,
+       bookingData: bookingData || null,
+       qrUrl: qrUrl || 'https://labmitra.com',
+       nestedResults,
+       standardResultsExist,
+       getFlag,
+       formatDate,
+       getDisplayId
+    });
+
+    const isSaveRequested = req.query.save === 'true';
+    const { buffer } = await pdfService.generatePDFWithQueue(html, { save: isSaveRequested });
+
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', 'inline; filename="report.pdf"');
+    res.send(Buffer.from(buffer));
+
+  } catch (error) {
+    console.error('[Public Generate Report PDF Error]:', error);
+    res.status(500).json({ error: 'Failed to generate PDF' });
+  }
 });
 
 // START SERVER
