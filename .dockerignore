@@ -1,0 +1,6 @@
+node_modules
+npm-debug.log
+reports/*.pdf
+.git
+.env
+serviceAccountKey.json
