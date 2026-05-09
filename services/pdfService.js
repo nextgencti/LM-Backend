@@ -38,12 +38,14 @@ async function getBrowser() {
             '--disable-setuid-sandbox',
             '--disable-dev-shm-usage', // Critical for Docker/low-RAM
             '--disable-gpu',
-            '--disable-software-rasterizer',
+            '--no-first-run',
+            '--no-zygote',
+            '--single-process', // Critical for 512MB RAM environments like Render
             '--disable-extensions',
-            '--mute-audio',
-            '--window-size=800,600'
+            '--mute-audio'
         ],
-        // Set ignoreHTTPSErrors if needed in dev
+        // Use environment variable for executable path if provided (e.g. for Render/Docker)
+        executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || puppeteer.executablePath() || null,
         ignoreHTTPSErrors: true,
     }).then(browser => {
         globalBrowser = browser;
@@ -56,7 +58,8 @@ async function getBrowser() {
         console.log('[PDF_SERVICE] Puppeteer Browser Instance Ready');
         return browser;
     }).catch(err => {
-        console.error('[PDF_SERVICE] Failed to launch browser:', err);
+        console.error('[PDF_SERVICE] Failed to launch browser. This is often due to missing shared libraries on Linux/Render:', err.message);
+        console.error('[DEBUG INFO] Arch:', process.arch, 'Platform:', process.platform);
         browserPromise = null;
         throw err;
     });
