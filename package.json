@@ -19,6 +19,7 @@
     "firebase-admin": "^13.7.0",
     "multer": "^2.1.1",
     "node-cron": "^4.2.1",
+    "nodemailer": "^8.0.7",
     "puppeteer": "^24.41.0",
     "qrcode": "^1.5.4"
   }

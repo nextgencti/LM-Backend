@@ -131,10 +131,14 @@ const checkSubscription = async (req, res, next) => {
     const subData = subDoc.data();
     const today = new Date().toISOString().split('T')[0];
     
-    // For fixed plans: check status and expiry
+    // For fixed plans (basic, pro, demo): check status and expiry
     if (subData.plan !== 'pay_as_you_go') {
         if (subData.status !== 'active' || (subData.expiryDate && subData.expiryDate < today)) {
-           return res.status(403).json({ error: "Subscription expired or suspended" });
+           const isDemoExpired = subData.plan === 'demo';
+           return res.status(403).json({ 
+             error: isDemoExpired ? "Your free demo trial has expired. Please purchase a subscription to continue." : "Subscription expired or suspended",
+             code: isDemoExpired ? 'DEMO_EXPIRED' : 'SUBSCRIPTION_EXPIRED'
+           });
         }
     } else {
         // For token plans: check if status is active (expiry doesn't apply to tokens usually, or handles differently)
@@ -912,6 +916,116 @@ app.post('/api/auth/verify-signup-otp', async (req, res) => {
     res.json({ success: true, message: "Email verified successfully" });
   } catch (error) {
     console.error("Verify Signup OTP Error:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// --- FORGOT PASSWORD OTP ---
+const nodemailer = require('nodemailer');
+
+app.post('/api/auth/forgot-password/send-otp', async (req, res) => {
+  const email = req.body.email?.trim();
+  if (!email) return res.status(400).json({ error: "Email is required" });
+
+  try {
+    const user = await admin.auth().getUserByEmail(email);
+    if (!user) {
+      return res.status(404).json({ error: "User not found" });
+    }
+  } catch (error) {
+    if (error.code === 'auth/user-not-found') {
+      return res.status(404).json({ error: "User not found" });
+    }
+    console.error("Firebase Auth Error:", error);
+    return res.status(500).json({ error: "Internal server error" });
+  }
+
+  try {
+    const otp = generateOTP();
+    const expiry = new Date();
+    expiry.setMinutes(expiry.getMinutes() + 10);
+
+    await db.collection('resetPasswordOtps').doc(email).set({
+      email,
+      otp,
+      expiry: admin.firestore.Timestamp.fromDate(expiry),
+      createdAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+
+    const gasUrl = process.env.GAS_API_KEY;
+    
+    if (gasUrl) {
+      const emailHtml = `
+        <div style="font-family: sans-serif; max-width: 500px; margin: auto; padding: 20px; border: 1px solid #eee; border-radius: 10px;">
+          <h2 style="color: #0f172a; text-align: center;">Reset Your Password</h2>
+          <p>Hello,</p>
+          <p>Your OTP for resetting your password is:</p>
+          <div style="background: #f1f5f9; padding: 20px; text-align: center; font-size: 32px; font-weight: 900; letter-spacing: 5px; color: #0f172a; border-radius: 8px; margin: 20px 0;">
+            ${otp}
+          </div>
+          <p style="color: #64748b; font-size: 13px;">This code will expire in 10 minutes. If you didn't request this, please ignore this email.</p>
+        </div>
+      `;
+
+      const emailRes = await fetch(gasUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        redirect: 'follow',
+        body: JSON.stringify({ 
+          action: 'SEND_EMAIL_HTML',
+          email: email,
+          patientName: 'User',
+          subject: `Password Reset Code: ${otp}`, 
+          html: emailHtml 
+        })
+      });
+      
+      const emailText = await emailRes.text().catch(() => '');
+      if (!emailRes.ok) {
+        console.error(`GAS email error (${emailRes.status}): ${emailText}`);
+      }
+    } else {
+      console.log(`[DEV MODE] Password Reset OTP for ${email} is ${otp}`);
+    }
+
+    res.json({ success: true, message: "OTP sent to your email" });
+  } catch (error) {
+    console.error("Send Reset OTP Error:", error);
+    res.status(500).json({ error: "Failed to send OTP." });
+  }
+});
+
+app.post('/api/auth/forgot-password/reset', async (req, res) => {
+  const { otp, newPassword } = req.body;
+  const email = req.body.email?.trim();
+  if (!email || !otp || !newPassword) return res.status(400).json({ error: "Email, OTP and new password are required" });
+
+  try {
+    const otpDoc = await db.collection('resetPasswordOtps').doc(email).get();
+    if (!otpDoc.exists) {
+      return res.status(400).json({ error: "OTP expired or not found." });
+    }
+
+    const data = otpDoc.data();
+    const now = new Date();
+
+    if (now > data.expiry.toDate()) {
+      await db.collection('resetPasswordOtps').doc(email).delete();
+      return res.status(400).json({ error: "OTP has expired." });
+    }
+
+    if (data.otp !== otp) {
+      return res.status(400).json({ error: "Invalid OTP code." });
+    }
+
+    const user = await admin.auth().getUserByEmail(email);
+    await admin.auth().updateUser(user.uid, { password: newPassword });
+
+    await db.collection('resetPasswordOtps').doc(email).delete();
+
+    res.json({ success: true, message: "Password reset successfully" });
+  } catch (error) {
+    console.error("Reset Password Error:", error);
     res.status(500).json({ error: "Internal server error" });
   }
 });
@@ -2081,6 +2195,129 @@ function buildWelcomeEmailHtml({ labName, ownerName, email, tempPassword, labId,
 </html>`.trim();
 }
 
+// Helper: Build Demo Welcome Email HTML
+function buildDemoWelcomeEmailHtml({ labName, ownerName, email, tempPassword, labId, licenseKey, expiryDate, demoDays, phone, address, city, state, pincode }) {
+  const fullAddress = [address, city, state, pincode].filter(Boolean).join(', ') || 'Not Provided';
+  const formattedExpiry = expiryDate ? expiryDate.split('-').reverse().join('/') : 'N/A';
+
+  return `
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f0f4f8; margin: 0; padding: 20px; }
+    .container { max-width: 640px; margin: 0 auto; background: white; border-radius: 32px; overflow: hidden; box-shadow: 0 20px 60px rgba(0,0,0,0.06); border: 1px solid #e2e8f0; }
+    .header { background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%); padding: 48px 40px; text-align: center; }
+    .header h1 { color: white; margin: 0; font-size: 28px; letter-spacing: -0.5px; font-weight: 900; text-transform: uppercase; }
+    .header p { color: #94a3b8; margin: 8px 0 0; font-size: 11px; letter-spacing: 3px; text-transform: uppercase; font-weight: 700; }
+    .demo-badge { display: inline-block; background: linear-gradient(135deg, #a3e635, #65a30d); color: #0f172a; padding: 10px 32px; border-radius: 100px; font-size: 13px; font-weight: 900; letter-spacing: 2px; text-transform: uppercase; margin-top: 20px; box-shadow: 0 4px 20px rgba(163,230,53,0.4); }
+    .demo-days { display: inline-block; background: rgba(163,230,53,0.15); color: #a3e635; padding: 8px 24px; border-radius: 12px; font-size: 22px; font-weight: 900; letter-spacing: 1px; margin-top: 16px; border: 1px solid rgba(163,230,53,0.2); }
+    .body { padding: 48px 40px; }
+    .greeting { font-size: 24px; font-weight: 900; color: #0f172a; margin-bottom: 8px; letter-spacing: -0.5px; }
+    .subtitle { color: #64748b; font-size: 15px; line-height: 1.6; margin-bottom: 32px; }
+    .pro-banner { background: linear-gradient(135deg, #7c3aed 0%, #6d28d9 100%); border-radius: 20px; padding: 24px; margin-bottom: 24px; text-align: center; }
+    .pro-banner h3 { color: white; font-size: 14px; font-weight: 900; text-transform: uppercase; letter-spacing: 2px; margin: 0 0 4px; }
+    .pro-banner p { color: rgba(255,255,255,0.7); font-size: 12px; margin: 0; }
+    .section-title { font-size: 10px; font-weight: 900; color: #94a3b8; text-transform: uppercase; letter-spacing: 2px; margin-bottom: 12px; margin-top: 32px; padding-bottom: 8px; border-bottom: 2px solid #f1f5f9; }
+    .info-card { background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 20px; padding: 24px; margin-bottom: 16px; }
+    .info-row { display: flex; justify-content: space-between; align-items: center; padding: 10px 0; border-bottom: 1px solid #f1f5f9; }
+    .info-row:last-child { border-bottom: none; }
+    .label { font-size: 11px; color: #94a3b8; font-weight: 800; text-transform: uppercase; letter-spacing: 1.5px; }
+    .value { font-size: 14px; color: #0f172a; font-weight: 700; text-align: right; max-width: 60%; }
+    .credential-card { background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%); border-radius: 20px; padding: 28px; margin-bottom: 16px; }
+    .cred-row { display: flex; justify-content: space-between; align-items: center; padding: 10px 0; border-bottom: 1px solid rgba(255,255,255,0.08); }
+    .cred-row:last-child { border-bottom: none; }
+    .cred-label { font-size: 11px; color: #94a3b8; font-weight: 800; text-transform: uppercase; letter-spacing: 1.5px; }
+    .cred-value { font-size: 14px; color: #a3e635; font-weight: 700; font-family: 'Courier New', monospace; letter-spacing: 1px; }
+    .warning { background: #fef3c7; border: 1px solid #fde68a; border-radius: 12px; padding: 16px; margin-top: 24px; font-size: 12px; color: #92400e; line-height: 1.6; }
+    .warning strong { color: #78350f; }
+    .footer { background: #f8fafc; padding: 28px 40px; text-align: center; border-top: 1px solid #f1f5f9; }
+    .footer p { margin: 0; font-size: 11px; color: #94a3b8; font-weight: 600; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <h1>Lab Mitra</h1>
+      <p>Laboratory Management Platform</p>
+      <div class="demo-badge">🎉 Free Demo Activated</div>
+      <div class="demo-days">${demoDays} Days Free Trial</div>
+    </div>
+    <div class="body">
+      <div class="greeting">Welcome, ${ownerName || 'Admin'}!</div>
+      <div class="subtitle">Your free demo account is now active! You have <strong>${demoDays} days</strong> to explore all PRO features with full access. No payment required during the trial.</div>
+
+      <div class="pro-banner">
+        <h3>✨ Full PRO Access Unlocked</h3>
+        <p>Enjoy all premium features during your demo period</p>
+      </div>
+
+      <div class="section-title">🔐 Login Credentials</div>
+      <div class="credential-card">
+        <div class="cred-row">
+          <span class="cred-label">Email</span>
+          <span class="cred-value">${email}</span>
+        </div>
+        <div class="cred-row">
+          <span class="cred-label">Password</span>
+          <span class="cred-value">${tempPassword}</span>
+        </div>
+      </div>
+
+      <div class="section-title">🏥 Lab Profile</div>
+      <div class="info-card">
+        <div class="info-row">
+          <span class="label">Lab Name</span>
+          <span class="value">${labName}</span>
+        </div>
+        <div class="info-row">
+          <span class="label">Owner / Admin</span>
+          <span class="value">${ownerName || 'N/A'}</span>
+        </div>
+        <div class="info-row">
+          <span class="label">Contact</span>
+          <span class="value">${phone || 'N/A'}</span>
+        </div>
+        <div class="info-row">
+          <span class="label">Lab ID</span>
+          <span class="value">${labId}</span>
+        </div>
+        <div class="info-row">
+          <span class="label">Address</span>
+          <span class="value">${fullAddress}</span>
+        </div>
+      </div>
+
+      <div class="section-title">📋 Demo Details</div>
+      <div class="info-card">
+        <div class="info-row">
+          <span class="label">Plan</span>
+          <span class="value" style="color: #7c3aed; font-weight: 900;">FREE DEMO (PRO)</span>
+        </div>
+        <div class="info-row">
+          <span class="label">License Key</span>
+          <span class="value" style="font-family: 'Courier New', monospace; font-size: 12px;">${licenseKey}</span>
+        </div>
+        <div class="info-row">
+          <span class="label">Demo Ends On</span>
+          <span class="value" style="color: #dc2626; font-weight: 900;">${formattedExpiry}</span>
+        </div>
+      </div>
+
+      <div class="warning">
+        <strong>⚠ What happens after the demo?</strong><br>
+        After ${demoDays} days, your account access will be paused. Your data will be safely preserved. To continue using Lab Mitra, simply purchase a subscription plan. Contact our support team for assistance.
+      </div>
+    </div>
+    <div class="footer">
+      <p>This is an automated welcome email from Lab Mitra • Do not reply</p>
+    </div>
+  </div>
+</body>
+</html>`.trim();
+}
+
 // Helper: Build HTML email for Super Admin Signup Alerts
 function buildAdminSignupAlertHtml({ labName, ownerName, email, phone, plan }) {
   const planLabel = (plan || 'basic').replace(/_/g, ' ').toUpperCase();
@@ -2198,6 +2435,201 @@ app.post('/api/signup/notify-admin', async (req, res) => {
   } catch (err) {
     console.error('[NotifyAdmin Error]', err.message);
     res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── AUTO-PROVISION ENDPOINT (Demo Trial) ──────────────────────────────────
+// POST /api/signup/auto-provision
+// Called from Signup page — instantly creates lab with demo subscription
+app.post('/api/signup/auto-provision', async (req, res) => {
+  const {
+    labName, labFullName, email,
+    labType, ownerName, phone, licenseNo,
+    address, city, state, pincode
+  } = req.body;
+
+  if (!labName || !email || !ownerName) {
+    return res.status(400).json({ error: 'Lab Name, Admin Email and Owner Name are required' });
+  }
+
+  try {
+    // 1. Check if email is already taken
+    try {
+      const existingUser = await admin.auth().getUserByEmail(email);
+      if (existingUser) {
+        return res.status(409).json({ error: 'This email is already registered. Please login instead.' });
+      }
+    } catch (authErr) {
+      if (authErr.code !== 'auth/user-not-found') {
+        throw authErr;
+      }
+    }
+
+    // 2. Read demo duration from global settings
+    let demoDays = 30; // Default: 30 days
+    try {
+      const demoSettingsDoc = await db.collection('settings').doc('global').get();
+      if (demoSettingsDoc.exists) {
+        const gData = demoSettingsDoc.data();
+        if (gData.demoDays && Number(gData.demoDays) > 0) {
+          demoDays = Number(gData.demoDays);
+        }
+      }
+    } catch (e) {
+      console.warn('[AutoProvision] Could not read demo settings, using default 30 days');
+    }
+
+    // 3. Generate lab credentials
+    const labId = `LAB-${Math.random().toString(36).substring(2, 8).toUpperCase()}`;
+    const licenseKey = `DEMO-${Math.random().toString(36).substring(2, 10).toUpperCase()}`;
+    const tempPassword = `Demo@${Math.floor(1000 + Math.random() * 9000)}`;
+
+    const expiry = new Date();
+    expiry.setDate(expiry.getDate() + demoDays);
+    const expiryDate = expiry.toISOString().split('T')[0];
+    const expiryTimestamp = admin.firestore.Timestamp.fromDate(expiry);
+    const today = new Date().toISOString().split('T')[0];
+
+    // 4. Create Firebase Auth User
+    const userRecord = await admin.auth().createUser({
+      email,
+      password: tempPassword,
+      displayName: ownerName || `${labName} Admin`
+    });
+
+    // 5. Set Custom Claims (role + labId)
+    await admin.auth().setCustomUserClaims(userRecord.uid, {
+      role: 'LabAdmin',
+      labId: labId
+    });
+
+    // 6. Create Lab Document
+    await db.collection('labs').doc(labId).set({
+      labId,
+      labName: labFullName || labName,
+      email,
+      labType: labType || 'Standalone',
+      ownerName: ownerName || '',
+      phone: phone || '',
+      licenseNo: licenseNo || '',
+      address: address || '',
+      city: city || '',
+      state: state || '',
+      pincode: pincode || '',
+      status: 'Active',
+      createdAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+
+    // 7. Create Subscription Document (Demo plan with PRO features)
+    await db.collection('subscriptions').doc(labId).set({
+      labId,
+      labName: labFullName || labName,
+      plan: 'demo',
+      status: 'active',
+      license_key: licenseKey,
+      startDate: today,
+      expiryDate,
+      expiryTimestamp,
+      demoDays,
+      createdAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+
+    // 8. Create User Document in Firestore
+    await db.collection('users').doc(userRecord.uid).set({
+      uid: userRecord.uid,
+      name: ownerName || `${labName} Admin`,
+      email,
+      role: 'LabAdmin',
+      labId: labId,
+      createdAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+
+    // 9. Save to signupRequests for audit trail
+    await db.collection('signupRequests').add({
+      labName,
+      labFullName: labFullName || labName,
+      email,
+      labType: labType || 'Standalone',
+      ownerName: ownerName || '',
+      phone: phone || '',
+      licenseNo: licenseNo || '',
+      address: address || '',
+      city: city || '',
+      state: state || '',
+      pincode: pincode || '',
+      plan: 'demo',
+      status: 'auto_provisioned',
+      labId,
+      createdAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+
+    // 10. Send Demo Welcome Email
+    try {
+      const welcomeHtml = buildDemoWelcomeEmailHtml({
+        labName: labFullName || labName,
+        ownerName, email, tempPassword, labId, licenseKey,
+        expiryDate, demoDays,
+        phone, address, city, state, pincode
+      });
+      await sendServerEmail({
+        to: email,
+        subject: `🎉 Your Free Demo is Active - Lab Mitra`,
+        html: welcomeHtml,
+        labName: 'Lab Mitra'
+      });
+      console.log(`[AutoProvision] Demo welcome email sent to ${email}`);
+    } catch (emailErr) {
+      console.error('[AutoProvision] Welcome email failed:', emailErr.message);
+    }
+
+    // 11. Notify Super Admins about new demo signup
+    try {
+      const adminsSnap = await db.collection('users').where('role', '==', 'SuperAdmin').get();
+      const alertHtml = buildAdminSignupAlertHtml({
+        labName: labFullName || labName,
+        ownerName, email, phone,
+        plan: 'demo (auto-provisioned)'
+      });
+      const promises = adminsSnap.docs.map(async (docSnap) => {
+        const adminData = docSnap.data();
+        if (adminData.email) {
+          await sendServerEmail({
+            to: adminData.email,
+            subject: `🆕 Auto-Provisioned Demo: ${labFullName || labName}`,
+            html: alertHtml,
+            labName: 'Lab Mitra Alert'
+          });
+        }
+      });
+      await Promise.all(promises);
+    } catch (notifyErr) {
+      console.warn('[AutoProvision] Admin notification failed:', notifyErr.message);
+    }
+
+    console.log(`[AutoProvision] Demo lab created: ${labId} for ${email} (${demoDays} days)`);
+
+    res.json({
+      success: true,
+      labId,
+      licenseKey,
+      email,
+      tempPassword,
+      demoDays,
+      expiryDate,
+      message: `Demo lab created successfully! ${demoDays}-day free trial activated.`
+    });
+  } catch (error) {
+    console.error('[AutoProvision] Error:', error);
+    // If user was partially created, try to clean up
+    if (error.code !== 'auth/email-already-exists') {
+      try {
+        const userToDelete = await admin.auth().getUserByEmail(email);
+        await admin.auth().deleteUser(userToDelete.uid);
+      } catch (cleanupErr) {
+        // Ignore cleanup errors
+      }
+    }
+    res.status(500).json({ error: error.message || 'Failed to create demo account' });
   }
 });
 
