@@ -1863,14 +1863,43 @@ app.post('/api/tests/sync-to-lab', authenticateJWT, isSuperAdmin, async (req, re
 });
 
 // ─────────────────────────────────────────────────────────────
+// PDF GENERATION ENDPOINT (For Preview)
+// ─────────────────────────────────────────────────────────────
+app.post('/api/generate-pdf', authenticateJWT, async (req, res) => {
+  try {
+    const { html } = req.body;
+    if (!html) return res.status(400).json({ error: 'HTML content is required' });
+
+    const browser = await puppeteer.launch({
+      headless: 'new',
+      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--font-render-hinting=none']
+    });
+    const page = await browser.newPage();
+    await page.setContent(html, { waitUntil: 'networkidle0' });
+    const pdfBuffer = await page.pdf({
+      format: 'A4',
+      margin: { top: '10mm', right: '10mm', bottom: '10mm', left: '10mm' },
+      printBackground: true
+    });
+    await browser.close();
+
+    const pdfBase64 = Buffer.from(pdfBuffer).toString('base64');
+    return res.json({ success: true, pdfBase64 });
+  } catch (error) {
+    console.error('PDF Generation Error:', error);
+    res.status(500).json({ error: 'Failed to generate PDF' });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────
 // EMAIL NOTIFICATION ENDPOINT
 // ─────────────────────────────────────────────────────────────
 // POST /api/send-notification
-// Body: { to, patientName, labName, bookingId, testNames, reportUrl? }
+// Body: { to, patientName, labName, bookingId, testNames, reportUrl?, reportHtml?, pdfBase64?, generatePdfFromHtml? }
 // Reads emailProvider from settings/global and routes accordingly.
 app.post('/api/send-notification', authenticateJWT, async (req, res) => {
   try {
-    let { to, subject, patientName, labName, bookingId, labId, testNames, reportUrl, reportHtml, pdfBase64 } = req.body;
+    let { to, subject, patientName, labName, bookingId, labId, testNames, reportUrl, reportHtml, pdfBase64, generatePdfFromHtml } = req.body;
 
     // ── DATA ENRICHMENT ──
     // If essential info is missing, fetch it using Admin SDK (bypasses client-side permission issues)
@@ -1929,17 +1958,41 @@ app.post('/api/send-notification', authenticateJWT, async (req, res) => {
     const testsFormatted = Array.isArray(testNames) ? testNames.join(', ') : (testNames || 'N/A');
 
     // Generate standard HTML template only if custom reportHtml is not provided
-    const emailHtml = reportHtml || buildEmailHtml({ patientName, labName, bookingId, testsFormatted, reportUrl });
+    let emailHtml = reportHtml || buildEmailHtml({ patientName, labName, bookingId, testsFormatted, reportUrl });
+    let finalPdfBase64 = pdfBase64;
+
+    if (generatePdfFromHtml && reportHtml) {
+      try {
+        console.log("Generating PDF from HTML for email attachment...");
+        const browser = await puppeteer.launch({
+          headless: 'new',
+          args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--font-render-hinting=none']
+        });
+        const page = await browser.newPage();
+        await page.setContent(reportHtml, { waitUntil: 'networkidle0' });
+        const pdfBuffer = await page.pdf({
+          format: 'A4',
+          margin: { top: '10mm', right: '10mm', bottom: '10mm', left: '10mm' },
+          printBackground: true
+        });
+        await browser.close();
+        finalPdfBase64 = Buffer.from(pdfBuffer).toString('base64');
+        // If sending as PDF attachment, use a simple email body instead of the full HTML report
+        emailHtml = buildEmailHtml({ patientName, labName, bookingId, testsFormatted: "Ledger Document", reportUrl: null });
+      } catch (e) {
+        console.error("Error generating PDF from HTML for email:", e);
+      }
+    }
 
     // 2. Send via Unified Helper
     const result = await sendServerEmail({
       to,
-      subject: subject || (pdfBase64 || reportHtml 
+      subject: subject || (finalPdfBase64 || reportHtml 
         ? `Pathology Report - ${patientName} (${labName || 'Lab'})`
         : `Your Lab Report is Ready - ${labName || 'Lab Mitra'}`),
       html: emailHtml,
       labName,
-      pdfBase64
+      pdfBase64: finalPdfBase64
     });
 
     return res.json({ success: true, result });
@@ -2657,7 +2710,13 @@ async function sendServerEmail({ to, subject, html, labName, pdfBase64 }) {
         from: `${labName || 'Lab Mitra'} <onboarding@resend.dev>`,
         to: [to],
         subject: subject,
-        html: html
+        html: html,
+        attachments: pdfBase64 ? [
+          {
+            filename: 'Report.pdf',
+            content: pdfBase64
+          }
+        ] : undefined
       }, {
         headers: { 'Authorization': `Bearer ${resendApiKey}` }
       });

@@ -268,7 +268,7 @@
                               const catName = firstP._category || 'General';
                               const samType = firstP._sampleType || 'N/A';
                               %>
-                              <div class="w-full bg-transparent">
+                              <div class="w-full bg-transparent" style="page-break-inside: avoid; break-inside: avoid;">
                                 <div
                                   class="bg-emerald-50/50 border-l-4 border-emerald-600 px-4 py-1.5 mb-2 flex items-baseline gap-3">
                                   <h2
@@ -286,8 +286,8 @@
                                   <% Object.entries(grpData).forEach(([grpN, params])=> {
                                     const isWid = testTit.toUpperCase().includes('WIDAL') ||
                                     grpN.toUpperCase().includes('WIDAL');
-                                    const isGridTy = params[0]?.dataType === 'Grid' || params[0]?.dataType === 'Titer'
-                                    || reportData?.reportLayout === 'Tabular table' || isWid;
+                                    const isGrid = params[0]?.dataType === 'Grid' || params[0]?.dataType === 'Titer' || isWid;
+                                    const isGridTy = isGrid || reportData?.reportLayout === 'Tabular table';
                                     %>
                                     <div class="mb-0 w-full bg-transparent">
                                       <% if (grpN && grpN.toUpperCase() !=='GENERAL' ) { %>
@@ -300,26 +300,27 @@
                                         </div>
                                         <% } %>
 
-                                          <% if (isGridTy) { const allT=new Set(); params.forEach(res=> { try {
+                                          <% if (isGrid) { const allT=new Set(); params.forEach(res=> { try {
                                             Object.keys(JSON.parse(res.value || '{}')).forEach(k => allT.add(k)); }
                                             catch(e){} });
                                             let titrs = Array.from(allT).sort((a,b) => (parseInt(a.split(':')[1])||0) -
                                             (parseInt(b.split(':')[1])||0));
-                                            if (isWid) titrs = titrs.length ? titrs.filter(t =>
-                                            (parseInt(t.split(':')[1])||0)<=320) :
-                                              ["1:20","1:40","1:80","1:160","1:320"]; %>
+                                            if (isWid) {
+                                              titrs = ["1:20","1:40","1:80","1:160","1:320"];
+                                            } %>
                                               <div
-                                                class="widal-grid border-[1.5px] border-gray-500 rounded-none overflow-x-auto shadow-sm bg-transparent mt-2 mb-4">
-                                                <table class="w-full text-left bg-transparent">
+                                                class="widal-grid border-[1.5px] border-gray-500 rounded-none overflow-x-auto shadow-sm bg-transparent mt-2 mb-4"
+                                                style="page-break-inside: avoid; break-inside: avoid;">
+                                                <table class="w-full text-left bg-transparent table-fixed">
                                                   <thead>
                                                     <tr
                                                       class="bg-gray-100 border-b-[1.5px] border-gray-500 text-gray-900">
                                                       <th
-                                                        class="py-2 px-3 text-[9px] font-black uppercase tracking-widest leading-none border-r border-gray-500">
+                                                        class="py-2 px-3 text-[9px] font-black uppercase tracking-widest leading-none border-r border-gray-500 w-[40%]">
                                                         Parameter</th>
                                                       <% titrs.forEach((t, idx)=> { %>
                                                         <th
-                                                          class="py-2 px-1 text-[9px] font-black uppercase text-center leading-none tracking-tighter border-r border-gray-500">
+                                                          class="py-2 px-1 text-[9px] font-black uppercase text-center leading-none tracking-tighter border-r border-gray-500 w-[12%]">
                                                           <%= t %>
                                                         </th>
                                                         <% }) %>
@@ -332,17 +333,23 @@
                                                       %>
                                                       <tr class="bg-transparent">
                                                         <td
-                                                          class="py-1 px-3 text-[10px] font-medium text-gray-800 border-r border-gray-500 leading-none">
+                                                          class="py-1 px-3 text-[10px] font-medium text-gray-800 border-r border-gray-500 leading-tight">
                                                           <%= res.parameter || res.name %>
                                                         </td>
                                                           <% titrs.forEach((t, tidx)=> {
-                                                            const v_g = vm_grid[t] || '-'; const isRea_g =
-                                                            String(v_g).toUpperCase().includes('POS') ||
-                                                            String(v_g).toUpperCase().includes('REA');
+                                                            const v_g = vm_grid[t] || '-';
+                                                            let colorClass = 'text-gray-400';
+                                                            if (v_g.toUpperCase() === 'REACTIVE') {
+                                                              colorClass = 'text-red-600 font-bold';
+                                                            } else if (v_g.toUpperCase() === 'WEAKLY') {
+                                                              colorClass = 'text-red-400 font-bold';
+                                                            } else if (v_g !== '-') {
+                                                              colorClass = 'text-red-600 font-bold';
+                                                            }
                                                             %>
                                                           <td
-                                                            class="py-1 px-1 text-[12px] font-medium text-center <%= isRea_g ? 'text-red-600 font-bold' : 'text-gray-400' %> border-r border-gray-500 leading-none">
-                                                            <%= v_g==='REACTIVE' ? '+' : v_g %>
+                                                            class="py-1 px-1 text-[10px] text-center <%= colorClass %> border-r border-gray-500 leading-none">
+                                                            <%= v_g %>
                                                           </td>
                                                           <% }) %>
                                                       </tr>
@@ -350,7 +357,78 @@
                                                   </tbody>
                                                 </table>
                                               </div>
-                                              <% } else { %>
+                                          <% } else if (reportData?.reportLayout === 'Tabular table') { %>
+                                              <div
+                                                class="widal-grid border-[1.5px] border-gray-500 rounded-none overflow-x-auto shadow-sm bg-transparent mt-2 mb-4"
+                                                style="page-break-inside: avoid; break-inside: avoid;">
+                                                <table class="w-full text-left bg-transparent table-fixed">
+                                                  <thead>
+                                                    <tr
+                                                      class="bg-gray-100 border-b-[1.5px] border-gray-500 text-gray-900">
+                                                      <th
+                                                        class="py-2 px-3 text-[9px] font-black uppercase tracking-widest leading-none border-r border-gray-500 w-[35%]">
+                                                        Parameter</th>
+                                                      <th
+                                                        class="py-2 px-3 text-[9px] font-black uppercase tracking-widest leading-none border-r border-gray-500 w-[15%]">
+                                                        Result</th>
+                                                      <th
+                                                        class="py-2 px-3 text-[9px] font-black uppercase tracking-widest leading-none border-r border-gray-500 w-[10%] text-center">
+                                                        Flag</th>
+                                                      <th
+                                                        class="py-2 px-3 text-[9px] font-black uppercase tracking-widest leading-none border-r border-gray-500 w-[15%]">
+                                                        Unit</th>
+                                                      <th
+                                                        class="py-2 px-3 text-[9px] font-black uppercase tracking-widest leading-none w-[25%] text-right">
+                                                        Ref. Range</th>
+                                                    </tr>
+                                                  </thead>
+                                                  <tbody class="divide-y-[1.5px] divide-gray-500 bg-transparent">
+                                                    <% params.forEach(res=> {
+                                                      const f = getFlag(res.value, res.range); const isAbn = f === 'H' || f === 'L';
+                                                      %>
+                                                      <tr class="bg-transparent <%= isAbn ? 'font-bold' : '' %>">
+                                                        <td
+                                                          class="py-2 px-3 text-[10px] <%= isAbn ? 'font-bold text-gray-900' : 'font-medium text-gray-600' %> border-r border-gray-500 leading-tight">
+                                                          <%= res.parameter || res.name %>
+                                                        </td>
+                                                        <td class="py-2 px-3 border-r border-gray-500 leading-tight">
+                                                          <% const valStr=String(res.value || '').toUpperCase(); 
+                                                             const isPos=valStr.includes('POSITIVE') || (valStr.includes('REACTIVE') && !valStr.includes('NON-REACTIVE')); 
+                                                             const isNeg=valStr.includes('NEGATIVE') || valStr.includes('NON-REACTIVE'); 
+                                                             if (isPos) { %>
+                                                              <span class="text-[10px] text-rose-600 font-bold">
+                                                                <%= res.value %>
+                                                              </span>
+                                                             <% } else if (isNeg) { %>
+                                                              <span class="text-[10px] text-emerald-600 font-bold">
+                                                                <%= res.value %>
+                                                              </span>
+                                                             <% } else { %>
+                                                              <span class="text-[10px] <%= isAbn ? (f==='H'?'text-rose-600 font-bold':'text-blue-600 font-bold') : 'text-gray-800 font-medium' %>">
+                                                                <%= res.value || '-' %>
+                                                              </span>
+                                                             <% } %>
+                                                        </td>
+                                                        <td class="py-2 px-3 text-center border-r border-gray-500 leading-none">
+                                                          <span
+                                                            class="text-[10px] font-bold <%= isAbn ? (f==='H'?'text-rose-600':'text-blue-600') : 'text-emerald-600' %>">
+                                                            <%= f %>
+                                                          </span>
+                                                        </td>
+                                                        <td
+                                                          class="py-2 px-3 text-[10px] font-medium text-slate-500 border-r border-gray-500 leading-tight">
+                                                          <%= res.unit || '-' %>
+                                                        </td>
+                                                        <td
+                                                          class="py-2 px-3 text-[10px] text-right tabular-nums <%= isAbn ? 'font-bold text-gray-900 border-gray-100 pl-2' : 'text-gray-500 font-medium' %> leading-tight">
+                                                          <%= res.range || res.normalRange || '-' %>
+                                                        </td>
+                                                      </tr>
+                                                    <% }) %>
+                                                  </tbody>
+                                                </table>
+                                              </div>
+                                          <% } else { %>
                                                 <div class="overflow-x-auto w-full">
                                                   <table class="w-full text-left bg-transparent">
                                                     <tbody class="divide-y divide-gray-50 bg-transparent">
